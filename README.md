@@ -14,14 +14,16 @@ Design details live in [PLAN.md](PLAN.md).
 - `oc` logged in as cluster-admin (`oc whoami` must succeed)
 - `curl`
 - [`yq`](https://github.com/mikefarah/yq) v4 (mikefarah)
-- OperatorHub reachable from the cluster (`redhat-operators` for NFD, `certified-operators` for
-  the GPU Operator)
+- An existing NFD deployment managed by `openshift-dpf`, including
+  `NodeFeatureDiscovery/nfd` in `openshift-nfd`
+- OperatorHub reachable from the cluster (`certified-operators` for the GPU Operator)
 
 ## What `run-recipe.sh` does
 
 1. Fetches `<url>/recipe.yaml` and validates it.
-2. Installs Node Feature Discovery + the NVIDIA GPU Operator via OLM, creates the `ClusterPolicy`,
-   and waits for it to be `ready`.
+2. Adds an NFD rule for the vendor-only NVIDIA GPU label without changing DPF's compound PCI
+   labels, installs the NVIDIA GPU Operator via OLM, creates the `ClusterPolicy`, and waits for it
+   to be `ready`.
 3. Finds GPU nodes (NFD label `feature.node.kubernetes.io/pci-10de.present=true`), groups them by
    CPU architecture, and reads `nvidia.com/gpu` capacity per node.
 4. For each architecture, picks an image via `image_for` (`<type>-<arch>`) and applies a

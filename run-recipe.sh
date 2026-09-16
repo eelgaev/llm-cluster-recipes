@@ -37,6 +37,7 @@ NS="${NS:-llm-recipes}"
 NFD_NS="openshift-nfd"
 GPU_NS="nvidia-gpu-operator"
 WORKLOAD_SA="llm-recipe"
+GPU_LABEL="feature.node.kubernetes.io/pci-10de.present=true"
 PORT=52395
 CSV_TIMEOUT="${CSV_TIMEOUT:-600}"          # seconds to wait for an operator CSV
 CLUSTERPOLICY_TIMEOUT="${CLUSTERPOLICY_TIMEOUT:-1800}"
@@ -179,107 +180,35 @@ log "Recipe '$RECIPE_NAME' type=$RECIPE_TYPE"
 log "Pods will register at $REGISTER_URL once healthy"
 
 # ----------------------------------------------------------------------------
-# 3. Install Node Feature Discovery + NVIDIA GPU Operator (OLM)
+# 3. Configure the parent-managed NFD + install NVIDIA GPU Operator (OLM)
 # ----------------------------------------------------------------------------
-install_nfd() {
-  log "Installing Node Feature Discovery operator"
-  # OLM allows only one OperatorGroup in an operator namespace. Reuse a group
-  # already managed by the cluster rather than creating a conflicting second one.
-  if [ "$DRY_RUN" = true ]; then
-    oc_apply <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $NFD_NS
----
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: nfd
-  namespace: $NFD_NS
-spec:
-  targetNamespaces:
-    - $NFD_NS
-EOF
-  else
-    oc_apply <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $NFD_NS
-EOF
-
-    local operator_groups operator_group_count
-    operator_groups=$(oc get operatorgroup -n "$NFD_NS" -o name 2>/dev/null || true)
-    if [ -z "$operator_groups" ]; then
-      operator_group_count=0
-    else
-      operator_group_count=$(printf '%s\n' "$operator_groups" | wc -l | tr -d ' ')
-    fi
-
-    case "$operator_group_count" in
-      0)
-        log "Creating NFD OperatorGroup"
-        oc_apply <<EOF
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: nfd
-  namespace: $NFD_NS
-spec:
-  targetNamespaces:
-    - $NFD_NS
-EOF
-        ;;
-      1) log "Reusing existing NFD OperatorGroup ($operator_groups)" ;;
-      *) die "expected at most one OperatorGroup in $NFD_NS, found $operator_group_count; resolve the conflict before continuing" ;;
-    esac
+configure_nfd_gpu_label() {
+  log "Configuring NVIDIA GPU detection in the existing NFD deployment"
+  if [ "$DRY_RUN" != true ]; then
+    wait_for "$CSV_TIMEOUT" "parent-managed NFD operator CSV Succeeded" \
+      csv_succeeded "$NFD_NS" nfd
+    oc get nodefeaturediscovery nfd -n "$NFD_NS" >/dev/null 2>&1 \
+      || die "parent-managed NodeFeatureDiscovery/nfd not found in $NFD_NS"
   fi
 
+  # DPF relies on compound PCI labels (class_vendor_device). Add the vendor-only
+  # label required by the NVIDIA GPU Operator without changing DPF's NFD config.
   oc_apply <<EOF
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
+apiVersion: nfd.openshift.io/v1alpha1
+kind: NodeFeatureRule
 metadata:
-  name: nfd
+  name: llm-nvidia-gpu-detection
   namespace: $NFD_NS
 spec:
-  channel: stable
-  name: nfd
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
-  installPlanApproval: Automatic
-EOF
-  [ "$DRY_RUN" = true ] && return
-  wait_for "$CSV_TIMEOUT" "NFD operator CSV Succeeded" csv_succeeded "$NFD_NS" nfd
-
-  # The NFD operand image must match the operator's version; take it from the CSV env.
-  local csv nfd_image
-  csv=$(oc get subscription nfd -n "$NFD_NS" -o jsonpath='{.status.installedCSV}')
-  nfd_image=$(oc get csv "$csv" -n "$NFD_NS" \
-    -o jsonpath='{.spec.install.spec.deployments[0].spec.template.spec.containers[0].env[?(@.name=="NODE_FEATURE_DISCOVERY_IMAGE")].value}')
-  [ -n "$nfd_image" ] || die "could not determine NFD operand image from CSV $csv"
-
-  log "Creating NodeFeatureDiscovery CR"
-  oc_apply <<EOF
-apiVersion: nfd.openshift.io/v1
-kind: NodeFeatureDiscovery
-metadata:
-  name: nfd-instance
-  namespace: $NFD_NS
-spec:
-  operand:
-    image: $nfd_image
-    servicePort: 12000
-  workerConfig:
-    configData: |
-      sources:
-        pci:
-          deviceClassWhitelist:
-            - "0200"
-            - "03"
-            - "12"
-          deviceLabelFields:
-            - "vendor"
+  rules:
+    - name: NVIDIA GPU detection
+      labels:
+        "pci-10de.present": "true"
+      matchFeatures:
+        - feature: pci.device
+          matchExpressions:
+            vendor: {op: In, value: ["10de"]}
+            class: {op: InRegexp, value: ["^03"]}
 EOF
 }
 
@@ -369,14 +298,12 @@ EOF
     sh -c '[ "$(oc get clusterpolicy gpu-cluster-policy -o jsonpath="{.status.state}")" = ready ]'
 }
 
-install_nfd
+configure_nfd_gpu_label
 install_gpu_operator
 
 # ----------------------------------------------------------------------------
 # 4. Discover GPU nodes, arch, and capacity
 # ----------------------------------------------------------------------------
-GPU_LABEL="feature.node.kubernetes.io/pci-10de.present=true"
-
 gpu_nodes_json() {
   oc get nodes -l "$GPU_LABEL" -o json
 }
