@@ -1,0 +1,30 @@
+name: qwen3-27b
+type: llama-cpp        # runtime; run-recipe.sh maps type + node arch -> image
+vars:
+  MODEL_NAME: unsloth/Qwen3.8-27B
+script: |
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export GGML_CUDA_P2P=1 GGML_CUDA_REGISTER_HOST=1 GGML_OP_OFFLOAD_MIN_BATCH=1
+  export GGML_CUDA_GRAPH_OPT=1 GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+
+  # weights + chat template are hosted next to recipe.yaml (RECIPE_BASE_URL)
+  wget -q "$RECIPE_BASE_URL/Qwen3.8-27B-UD-Q4_K_XL.gguf" -O /models/model.gguf
+  wget -q "$RECIPE_BASE_URL/mtp-Qwen3.8-27B-Q4_0.gguf"   -O /models/mtp.gguf
+  wget -q "$RECIPE_BASE_URL/mmproj-BF16.gguf"             -O /models/mmproj.gguf
+  wget -q "$RECIPE_BASE_URL/chat_template.jinja"          -O /models/chat_template.jinja
+
+  exec llama-server \
+      --host 0.0.0.0 --port "$PORT" \
+      --api-key "$API_KEY" \
+      --ssl-key-file "$TLS_KEY" --ssl-cert-file "$TLS_CRT" \
+      -m /models/model.gguf -md /models/mtp.gguf --mmproj /models/mmproj.gguf \
+      --load-mode none -ngl 99 --keep -1 --ctx-size 1048576 --parallel 4 \
+      --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on \
+      -sm tensor -ub 256 -b 2048 --jinja \
+      --chat-template-file /models/chat_template.jinja --reasoning-format deepseek \
+      --no-mmap --poll 0 -t 8 -tb 40 \
+      --alias "$MODEL_NAME" \
+      --spec-type draft-mtp --spec-draft-n-max 3 \
+      --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
+      --repeat-penalty 1.0 --presence-penalty 0.0 --reasoning-effort medium
