@@ -183,7 +183,10 @@ log "Pods will register at $REGISTER_URL once healthy"
 # ----------------------------------------------------------------------------
 install_nfd() {
   log "Installing Node Feature Discovery operator"
-  oc_apply <<EOF
+  # OLM allows only one OperatorGroup in an operator namespace. Reuse a group
+  # already managed by the cluster rather than creating a conflicting second one.
+  if [ "$DRY_RUN" = true ]; then
+    oc_apply <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -197,7 +200,43 @@ metadata:
 spec:
   targetNamespaces:
     - $NFD_NS
----
+EOF
+  else
+    oc_apply <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $NFD_NS
+EOF
+
+    local operator_groups operator_group_count
+    operator_groups=$(oc get operatorgroup -n "$NFD_NS" -o name 2>/dev/null || true)
+    if [ -z "$operator_groups" ]; then
+      operator_group_count=0
+    else
+      operator_group_count=$(printf '%s\n' "$operator_groups" | wc -l | tr -d ' ')
+    fi
+
+    case "$operator_group_count" in
+      0)
+        log "Creating NFD OperatorGroup"
+        oc_apply <<EOF
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: nfd
+  namespace: $NFD_NS
+spec:
+  targetNamespaces:
+    - $NFD_NS
+EOF
+        ;;
+      1) log "Reusing existing NFD OperatorGroup ($operator_groups)" ;;
+      *) die "expected at most one OperatorGroup in $NFD_NS, found $operator_group_count; resolve the conflict before continuing" ;;
+    esac
+  fi
+
+  oc_apply <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
