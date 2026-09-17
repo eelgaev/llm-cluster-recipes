@@ -22,19 +22,23 @@ Design details live in [PLAN.md](PLAN.md).
 
 1. Fetches `<url>/recipe.yaml` and validates it.
 2. Adds an NFD rule for the vendor-only NVIDIA GPU label without changing DPF's compound PCI
-   labels, installs the NVIDIA GPU Operator via OLM, creates the `ClusterPolicy`, and waits for it
-   to be `ready`.
-3. Finds GPU nodes (NFD label `feature.node.kubernetes.io/pci-10de.present=true`), groups them by
-   CPU architecture, and reads `nvidia.com/gpu` capacity per node.
-4. For each architecture, picks an image via `image_for` (`<type>-<arch>`) and applies a
-   DaemonSet `llm-recipe-<arch>` in namespace `llm-recipes` that:
+   labels, installs the NVIDIA GPU Operator via OLM, and creates the `ClusterPolicy`. GPU operands
+   are configured to tolerate not-ready nodes and use the external API endpoint, host networking,
+   and the host DNS resolver so their init containers can run before cluster pod networking.
+3. Finds GPU nodes (NFD label `feature.node.kubernetes.io/pci-10de.present=true`) and groups them by
+   CPU architecture.
+4. For each architecture, creates an in-cluster reconciler and returns immediately. The reconciler
+   waits until every matching node advertises `nvidia.com/gpu` capacity, then creates or updates
+   DaemonSet `llm-recipe-<arch>` (using `image_for`, `<type>-<arch>`) in namespace
+   `llm-recipes`. The DaemonSet:
    - runs with `hostNetwork: true` (server on `https://<node-ip>:52395`),
    - uses a dedicated service account granted the OpenShift `hostnetwork-v2` SCC,
    - requests every GPU on the node (`nvidia.com/gpu: N`),
    - mounts the recipe script from a ConfigMap at `/recipe/script.sh`,
    - has `emptyDir`s at `/models`, `/certs` and a memory-backed `/dev/shm`.
-5. Waits for the authenticated HTTPS health endpoint, then prints rollout status, node IPs, and a
-   log command. Recipe or server failures exit the container and remain visible as rollout failures.
+5. Prints node IPs and commands for following both the reconciler and workload. Kubernetes keeps
+   reconciling the controller objects after `run-recipe.sh` exits; recipe or server failures exit
+   the workload container and remain visible in pod status.
 
 Every step is idempotent; re-run the script after editing the recipe.
 
@@ -43,7 +47,8 @@ Environment knobs:
 | Var | Meaning |
 |---|---|
 | `NS` | target namespace (default `llm-recipes`) |
-| `CSV_TIMEOUT`, `CLUSTERPOLICY_TIMEOUT`, `GPU_CAPACITY_TIMEOUT`, `ROLLOUT_TIMEOUT` | wait limits in seconds |
+| `CSV_TIMEOUT` | seconds to wait for an operator CSV to install |
+| `RECONCILE_RESYNC` | safety resync period in seconds (default `300`); node changes reconcile immediately via an API watch |
 | `DRY_RUN=true` | render everything with `oc apply --dry-run=client` and skip the waits |
 
 Required flag:

@@ -21,9 +21,9 @@ set -euo pipefail
 # (a case statement rather than an associative array so stock macOS bash 3.2 works)
 image_for() {
   case "$1" in
-    llama-cpp-arm) echo "quay.io/PLACEHOLDER/llama-cpp:arm" ;;
-    llama-cpp-x86) echo "quay.io/PLACEHOLDER/llama-cpp:x86" ;;
-    vllm-x86)      echo "quay.io/PLACEHOLDER/vllm:x86" ;;
+    llama-cpp-arm) echo "quay.io/eelgaev/llama-cpp-arm:latest" ;;
+    llama-cpp-x86) echo "quay.io/eelgaev/llama-cpp-x86:latest" ;;
+    vllm-x86)      echo "quay.io/PLACEHOLDER/vllm:x86" ;; # Nahh
     # ... add more type-arch entries here ...
     *) return 1 ;;
   esac
@@ -40,16 +40,14 @@ WORKLOAD_SA="llm-recipe"
 GPU_LABEL="feature.node.kubernetes.io/pci-10de.present=true"
 PORT=52395
 CSV_TIMEOUT="${CSV_TIMEOUT:-600}"          # seconds to wait for an operator CSV
-CLUSTERPOLICY_TIMEOUT="${CLUSTERPOLICY_TIMEOUT:-1800}"
-GPU_CAPACITY_TIMEOUT="${GPU_CAPACITY_TIMEOUT:-600}"
-ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-1800}"
+RECONCILE_RESYNC="${RECONCILE_RESYNC:-300}"
 DRY_RUN="${DRY_RUN:-false}"                 # true -> skip cluster mutations, render only
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-for timeout_name in CSV_TIMEOUT CLUSTERPOLICY_TIMEOUT GPU_CAPACITY_TIMEOUT ROLLOUT_TIMEOUT; do
+for timeout_name in CSV_TIMEOUT RECONCILE_RESYNC; do
   timeout_value=${!timeout_name}
   [[ "$timeout_value" =~ ^[1-9][0-9]*$ ]] \
     || die "$timeout_name must be a positive integer (got: $timeout_value)"
@@ -293,16 +291,103 @@ EOF
     fi
   fi
 
-  log "Waiting for ClusterPolicy to become ready (driver build can take a while)"
-  wait_for "$CLUSTERPOLICY_TIMEOUT" "ClusterPolicy state=ready" \
-    sh -c '[ "$(oc get clusterpolicy gpu-cluster-policy -o jsonpath="{.status.state}")" = ready ]'
+  # GPU operands need to run before a DPF host is Ready. Preserve existing
+  # settings while adding the required taint tolerance and point
+  # k8s-driver-manager at the externally reachable API endpoint rather than the
+  # cluster Service VIP. Explicit manager env is supported by ClusterPolicy and
+  # survives GPU Operator reconciliation.
+  local api_url api_authority api_host api_port cp_patch
+  api_url=$(oc whoami --show-server)
+  api_authority=${api_url#https://}
+  api_authority=${api_authority%%/*}
+  api_host=${api_authority%:*}
+  api_port=${api_authority##*:}
+  [ -n "$api_host" ] && [ -n "$api_port" ] && [ "$api_host" != "$api_port" ] \
+    || die "could not parse API host and port from: $api_url"
+
+  # shellcheck disable=SC2016 # yq variables are intentionally single-quoted
+  cp_patch=$(API_HOST="$api_host" API_PORT="$api_port" \
+    oc get clusterpolicy gpu-cluster-policy -o json | \
+    API_HOST="$api_host" API_PORT="$api_port" yq -p json -o json -I=0 '
+      (.spec.daemonsets.tolerations // []) as $tolerations |
+      (.spec.driver.manager.env // []) as $manager_env |
+      {"spec": {
+        "daemonsets": {"tolerations": (
+          ($tolerations | map(select(
+            .key != "nvidia.com/gpu" and
+            .key != "node.kubernetes.io/not-ready"
+          ))) + [
+            {"key":"nvidia.com/gpu", "operator":"Exists", "effect":"NoSchedule"},
+            {"key":"node.kubernetes.io/not-ready", "operator":"Exists", "effect":"NoSchedule"}
+          ]
+        )},
+        "driver": {"manager": {"env": (
+          ($manager_env | map(select(
+            .name != "KUBERNETES_SERVICE_HOST" and
+            .name != "KUBERNETES_SERVICE_PORT"
+          ))) + [
+            {"name":"KUBERNETES_SERVICE_HOST", "value":strenv(API_HOST)},
+            {"name":"KUBERNETES_SERVICE_PORT", "value":strenv(API_PORT)}
+          ]
+        )}}
+      }}')
+  oc patch clusterpolicy gpu-cluster-policy --type=merge -p "$cp_patch" >/dev/null
+  log "Configured GPU operands for not-ready nodes and external API access"
+
+  # ClusterPolicy has no field for these common pod-level network settings.
+  # Patch every generated operand DaemonSet so API-using init containers (not
+  # just k8s-driver-manager) use host networking, the host resolver, and the
+  # external API endpoint. Strategic merge preserves all other container env.
+  # The GPU Operator preserves these fields when reconciling managed settings.
+  wait_for "$CSV_TIMEOUT" "NVIDIA driver DaemonSet to be generated" \
+    sh -c "oc get daemonsets -n '$GPU_NS' -o name | grep -q '/nvidia-driver-daemonset-'"
+  local operand_ds operand_json operand_patch
+  for operand_ds in $(oc get daemonsets -n "$GPU_NS" -o name | awk -F/ '{ print $2 }'); do
+    operand_json=$(oc get daemonset "$operand_ds" -n "$GPU_NS" -o json)
+    # shellcheck disable=SC2016 # yq variables are intentionally single-quoted
+    operand_patch=$(API_HOST="$api_host" API_PORT="$api_port" \
+      yq -p json -o json -I=0 '
+        . as $ds |
+        {"spec":{"template":{"spec":{
+          "hostNetwork":true,
+          "dnsPolicy":"Default",
+          "initContainers": (($ds.spec.template.spec.initContainers // []) |
+            map({"name":.name, "env":(
+              ((.env // []) | map(select(
+                .name != "KUBERNETES_SERVICE_HOST" and
+                .name != "KUBERNETES_SERVICE_PORT"
+              ))) + [
+                {"name":"KUBERNETES_SERVICE_HOST", "value":strenv(API_HOST)},
+                {"name":"KUBERNETES_SERVICE_PORT", "value":strenv(API_PORT)}
+              ]
+            )})),
+          "containers": (($ds.spec.template.spec.containers // []) |
+            map({"name":.name, "env":(
+              ((.env // []) | map(select(
+                .name != "KUBERNETES_SERVICE_HOST" and
+                .name != "KUBERNETES_SERVICE_PORT"
+              ))) + [
+                {"name":"KUBERNETES_SERVICE_HOST", "value":strenv(API_HOST)},
+                {"name":"KUBERNETES_SERVICE_PORT", "value":strenv(API_PORT)}
+              ]
+            )}))
+        }}}}' <<<"$operand_json")
+    oc patch daemonset "$operand_ds" -n "$GPU_NS" --type=strategic \
+      -p "$operand_patch" >/dev/null
+  done
+  log "Configured NVIDIA operand networking (hostNetwork, host DNS, external API)"
+
+  # ClusterPolicy and its operands are controllers themselves. Do not keep this
+  # client attached while they converge; the in-cluster workload reconciler below
+  # will wait for the device plugin to advertise GPU capacity.
+  log "ClusterPolicy submitted; GPU Operator will continue reconciling it"
 }
 
 configure_nfd_gpu_label
 install_gpu_operator
 
 # ----------------------------------------------------------------------------
-# 4. Discover GPU nodes, arch, and capacity
+# 4. Discover GPU-node architectures
 # ----------------------------------------------------------------------------
 gpu_nodes_json() {
   oc get nodes -l "$GPU_LABEL" -o json
@@ -310,29 +395,19 @@ gpu_nodes_json() {
 
 if [ "$DRY_RUN" = true ]; then
   warn "DRY_RUN: assuming one amd64 GPU group with 1 GPU"
-  ARCH_GROUPS="amd64 1"
+  ARCH_GROUPS="amd64"
 else
   log "Discovering GPU nodes (label $GPU_LABEL)"
   wait_for 120 "at least one node labeled $GPU_LABEL" \
     sh -c "oc get nodes -l '$GPU_LABEL' -o name | grep -q ."
 
-  # Device plugin may not have advertised capacity yet — wait for every GPU node to report >0.
-  all_nodes_have_capacity() {
-    local caps
-    caps=$(gpu_nodes_json | yq -p json -oy -r '.items[] | .status.capacity."nvidia.com/gpu" // "0"')
-    [ -n "$caps" ] && ! grep -qx '0' <<<"$caps"
-  }
-  wait_for "$GPU_CAPACITY_TIMEOUT" "nvidia.com/gpu capacity on all GPU nodes" all_nodes_have_capacity
-
-  # lines: "<arch> <min-gpu-count> <number-of-distinct-counts>" per distinct arch
+  # Capacity may not exist yet. Discover only architecture here; an in-cluster
+  # reconciler derives the GPU count and creates/updates the DaemonSet later.
   ARCH_GROUPS=$(gpu_nodes_json | yq -p json -oy -r '
     .items
-    | map({"arch": .status.nodeInfo.architecture,
-           "gpus": (.status.capacity."nvidia.com/gpu" | tonumber)})
-    | group_by(.arch)
-    | .[]
-    | (map(.gpus) | unique) as $counts
-    | .[0].arch + " " + (($counts | min) | tostring) + " " + (($counts | length) | tostring)')
+    | map(.status.nodeInfo.architecture)
+    | unique
+    | .[]')
 fi
 [ -n "$ARCH_GROUPS" ] || die "no GPU nodes found"
 
@@ -356,6 +431,12 @@ metadata:
   name: $WORKLOAD_SA
   namespace: $NS
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llm-recipe-reconciler
+  namespace: $NS
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
@@ -368,6 +449,52 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: $WORKLOAD_SA
+    namespace: $NS
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: llm-recipe-node-reader-$NS
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: llm-recipe-node-reader-$NS
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: llm-recipe-node-reader-$NS
+subjects:
+  - kind: ServiceAccount
+    name: llm-recipe-reconciler
+    namespace: $NS
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llm-recipe-daemonset-reconciler
+  namespace: $NS
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llm-recipe-daemonset-reconciler
+  namespace: $NS
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llm-recipe-daemonset-reconciler
+subjects:
+  - kind: ServiceAccount
+    name: llm-recipe-reconciler
     namespace: $NS
 EOF
 
@@ -495,22 +622,142 @@ spec:
 EOF
 }
 
+CLI_IMAGE="quay.io/openshift/origin-cli:latest"
+if [ "$DRY_RUN" != true ]; then
+  discovered_cli_image=$(oc adm release info --image-for=cli 2>/dev/null || true)
+  [ -z "$discovered_cli_image" ] || CLI_IMAGE=$discovered_cli_image
+fi
+
+# This controller-side loop is deliberately stored in-cluster. The invoking
+# shell can exit while it waits for every matching node to advertise capacity.
+yq e ".metadata.namespace = \"$NS\"" - <<'EOF' | oc_apply
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-recipe-reconciler-code
+  namespace: llm-recipes-placeholder
+data:
+  reconcile.sh: |
+    #!/usr/bin/env bash
+    set -uo pipefail
+
+    selector="feature.node.kubernetes.io/pci-10de.present=true,kubernetes.io/arch=${K8S_ARCH}"
+    previous=""
+    while :; do
+      capacities=$(oc get nodes -l "$selector" \
+        -o go-template='{{range .items}}{{index .status.capacity "nvidia.com/gpu"}}{{"\n"}}{{end}}' \
+        2>/dev/null || true)
+      summary=$(awk '
+        BEGIN { ok=1; count=0; min=0; distinct="" }
+        /^[1-9][0-9]*$/ {
+          value=$1+0; count++
+          if (min == 0 || value < min) min=value
+          if (!(value in seen)) { seen[value]=1; distinct=distinct " " value }
+          next
+        }
+        { ok=0 }
+        END { if (ok && count > 0) print min ":" count ":" distinct }
+      ' <<<"$capacities")
+
+      if [[ "$summary" =~ ^([1-9][0-9]*):([1-9][0-9]*):(.*)$ ]]; then
+        gpus=${BASH_REMATCH[1]}
+        nodes=${BASH_REMATCH[2]}
+        counts=${BASH_REMATCH[3]}
+        if [ "$summary" != "$previous" ]; then
+          echo "GPU capacity available on $nodes $K8S_ARCH node(s); using $gpus GPU(s) per pod (reported:$counts)"
+          previous=$summary
+        fi
+        sed "s/__GPU_COUNT__/$gpus/g" /template/daemonset.yaml > /tmp/daemonset.yaml
+        oc apply -n "$TARGET_NAMESPACE" -f /tmp/daemonset.yaml >/dev/null \
+          || echo "Could not reconcile $DS_NAME; retrying" >&2
+      elif [ "$previous" != waiting ]; then
+        echo "Waiting for every matching $K8S_ARCH GPU node to advertise nvidia.com/gpu capacity"
+        previous=waiting
+      fi
+      # React immediately to node status/label changes. The request timeout is
+      # only a slow safety resync in case the DaemonSet is changed or deleted
+      # without a corresponding node event.
+      oc --request-timeout="${RECONCILE_RESYNC}s" get nodes -l "$selector" \
+        --watch-only -o name 2>/dev/null | head -n 1 >/dev/null || true
+    done
+EOF
+
 DEPLOYED_ARCHES=
-while read -r k8s_arch gpus ncounts; do
+while read -r k8s_arch; do
   [ -n "$k8s_arch" ] || continue
   case "$k8s_arch" in
     amd64) arch=x86 ;;
     arm64) arch=arm ;;
     *) die "unsupported node architecture: $k8s_arch" ;;
   esac
-  [ "${ncounts:-1}" -gt 1 ] && warn "GPU nodes of arch $k8s_arch differ in GPU count; using minimum ($gpus)"
-
   key="${RECIPE_TYPE}-${arch}"
   image=$(image_for "$key") \
     || die "no image for '$key' (known: $KNOWN_IMAGES) — add an entry to image_for() in run-recipe.sh"
 
-  log "Deploying DaemonSet llm-recipe-$arch (image=$image, gpus/node=$gpus)"
-  render_daemonset "$arch" "$gpus" "$image" "$k8s_arch" | add_recipe_vars | oc_apply
+  # Keep a complete DaemonSet template in a ConfigMap. The placeholder is
+  # replaced only after node status contains a numeric GPU capacity.
+  ds_template="$WORKDIR/daemonset-$arch.yaml"
+  render_daemonset "$arch" "__GPU_COUNT__" "$image" "$k8s_arch" | add_recipe_vars > "$ds_template"
+  read -r template_crc template_bytes _ < <(cksum < "$ds_template")
+  template_checksum="${template_crc}-${template_bytes}"
+
+  log "Creating in-cluster reconciler for llm-recipe-$arch (image=$image)"
+  oc create configmap "llm-recipe-reconciler-$arch" -n "$NS" \
+      --from-file=daemonset.yaml="$ds_template" --dry-run=client -o yaml \
+    | oc_apply
+
+  oc_apply <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-recipe-reconciler-$arch
+  namespace: $NS
+  labels:
+    app: llm-recipe-reconciler
+    arch: $arch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-recipe-reconciler
+      arch: $arch
+  template:
+    metadata:
+      labels:
+        app: llm-recipe-reconciler
+        arch: $arch
+      annotations:
+        llm-recipes.openai.com/template-checksum: "$template_checksum"
+    spec:
+      serviceAccountName: llm-recipe-reconciler
+      containers:
+        - name: reconciler
+          image: $CLI_IMAGE
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/reconciler/reconcile.sh"]
+          env:
+            - name: TARGET_NAMESPACE
+              value: "$NS"
+            - name: K8S_ARCH
+              value: "$k8s_arch"
+            - name: DS_NAME
+              value: "llm-recipe-$arch"
+            - name: RECONCILE_RESYNC
+              value: "$RECONCILE_RESYNC"
+          volumeMounts:
+            - name: template
+              mountPath: /template
+            - name: reconciler
+              mountPath: /reconciler
+      volumes:
+        - name: template
+          configMap:
+            name: llm-recipe-reconciler-$arch
+        - name: reconciler
+          configMap:
+            name: llm-recipe-reconciler-code
+            defaultMode: 0755
+EOF
   DEPLOYED_ARCHES="$DEPLOYED_ARCHES $arch"
 done <<<"$ARCH_GROUPS"
 
@@ -528,15 +775,11 @@ fi
 # ----------------------------------------------------------------------------
 [ "$DRY_RUN" = true ] && { log "DRY_RUN complete"; exit 0; }
 
-for arch in $DEPLOYED_ARCHES; do
-  log "Rollout status for DaemonSet llm-recipe-$arch"
-  oc rollout status "ds/llm-recipe-$arch" -n "$NS" --timeout="${ROLLOUT_TIMEOUT}s" \
-    || die "rollout failed or timed out for llm-recipe-$arch"
-done
-
-log "Recipe '$RECIPE_NAME' deployed. Servers (hostNetwork) will be reachable at:"
+log "Recipe '$RECIPE_NAME' submitted. In-cluster reconcilers will create the DaemonSets when GPU capacity is available."
+log "Servers (hostNetwork) will then be reachable at:"
 oc get nodes -l "$GPU_LABEL" -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
   | sed "s|^|  https://|; s|\$|:$PORT|"
 echo
+log "Reconciler:      oc logs -f -l app=llm-recipe-reconciler -n $NS --all-containers --max-log-requests=20"
 log "Tail logs with:   oc logs -f -l app=llm-recipe -n $NS --all-containers --max-log-requests=20"
 log "Pods:             oc get pods -n $NS -o wide"
