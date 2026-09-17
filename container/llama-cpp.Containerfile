@@ -20,7 +20,8 @@ RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp.git \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
         -DGGML_NATIVE=OFF \
-    && cmake --build build -j"$(nproc)"
+        -DLLAMA_BUILD_LIBRESSL=ON -DLLAMA_BUILD_BORINGSSL=OFF -DLLAMA_OPENSSL=ON \
+    && cmake --build build -j"$(nproc)" --target llama-server
 
 
 # ---- Runtime -----------------------------------------------------------------
