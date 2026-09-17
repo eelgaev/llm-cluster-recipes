@@ -19,11 +19,12 @@ script: |
       --api-key "$API_KEY" \
       --ssl-key-file "$TLS_KEY" --ssl-cert-file "$TLS_CRT" \
       -m /models/model.gguf -md /models/mtp.gguf --mmproj /models/mmproj.gguf \
-      --load-mode none -ngl 99 --keep -1 --ctx-size 1048576 --parallel 4 \
+      --load-mode none -ngl 99 --keep -1 --ctx-size 4194304 \
+      --parallel 16 \
       --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on \
       -sm tensor -ub 256 -b 2048 --jinja \
       --chat-template-file /models/chat_template.jinja --reasoning-format deepseek \
-      --no-mmap --poll 0 -t 8 -tb 40 \
+      --poll 0 \
       --alias "$MODEL_NAME" \
       --spec-type draft-mtp --spec-draft-n-max 3 \
       --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
