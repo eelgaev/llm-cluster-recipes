@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-recipe-reconciler-arch
+  namespace: llm-recipes
+  labels:
+    app: llm-recipe-reconciler
+    arch: arch-placeholder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-recipe-reconciler
+      arch: arch-placeholder
+  template:
+    metadata:
+      labels:
+        app: llm-recipe-reconciler
+        arch: arch-placeholder
+      annotations:
+        llm-recipes.openai.com/template-checksum: checksum-placeholder
+    spec:
+      serviceAccountName: llm-recipe-reconciler
+      containers:
+        - name: reconciler
+          image: quay.io/openshift/origin-cli:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/reconciler/reconcile.sh"]
+          env:
+            - name: TARGET_NAMESPACE
+              value: llm-recipes
+            - name: K8S_ARCH
+              value: arch-placeholder
+            - name: DS_NAME
+              value: llm-recipe-arch
+            - name: RECONCILE_RESYNC
+              value: "300"
+          volumeMounts:
+            - name: template
+              mountPath: /template
+            - name: reconciler
+              mountPath: /reconciler
+      volumes:
+        - name: template
+          configMap:
+            name: llm-recipe-reconciler-arch
+        - name: reconciler
+          configMap:
+            name: llm-recipe-reconciler-code
+            defaultMode: 0755

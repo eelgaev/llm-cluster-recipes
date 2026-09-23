@@ -1,0 +1,15 @@
+apiVersion: nfd.openshift.io/v1alpha1
+kind: NodeFeatureRule
+metadata:
+  name: llm-nvidia-gpu-detection
+  namespace: openshift-nfd
+spec:
+  rules:
+    - name: NVIDIA GPU detection
+      labels:
+        "pci-10de.present": "true"
+      matchFeatures:
+        - feature: pci.device
+          matchExpressions:
+            vendor: {op: In, value: ["10de"]}
+            class: {op: InRegexp, value: ["^03"]}

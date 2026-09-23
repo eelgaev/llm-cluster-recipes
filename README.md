@@ -1,10 +1,26 @@
 # llm-cluster-recipes
 
-One script that installs the NVIDIA GPU Operator on an OpenShift cluster and runs an LLM
-"recipe" on **every GPU worker**, each pod getting **all GPUs on its node**.
+A small runner plus readable Kubernetes manifests that install the NVIDIA GPU Operator on an
+OpenShift cluster and run an LLM "recipe" on **every GPU worker**, each pod getting **all GPUs on
+its node**.
 
 ```
 ./run-recipe.sh https://host/recipes/qwen3.8-27B/ --register-url https://router.example.com/register
+```
+
+Remove the workload later with:
+
+```bash
+./run-recipe.sh uninstall
+```
+
+The runner can also be streamed directly; it clones this repository into a temporary directory so
+the adjacent manifests are available:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eelgaev/llm-cluster-recipes/main/run-recipe.sh \
+  | bash -s -- https://host/recipes/qwen3.8-27B/ \
+      --register-url https://router.example.com/register
 ```
 
 Design details live in [PLAN.md](PLAN.md).
@@ -13,6 +29,7 @@ Design details live in [PLAN.md](PLAN.md).
 
 - `oc` logged in as cluster-admin (`oc whoami` must succeed)
 - `curl`
+- `git`
 - [`yq`](https://github.com/mikefarah/yq) v4 (mikefarah)
 - An existing NFD deployment managed by `openshift-dpf`, including
   `NodeFeatureDiscovery/nfd` in `openshift-nfd`
@@ -20,7 +37,7 @@ Design details live in [PLAN.md](PLAN.md).
 
 ## What `run-recipe.sh` does
 
-1. Fetches `<url>/recipe.yaml` and validates it.
+1. Clones this repository at `REPO_REF`, then fetches `<url>/recipe.yaml` and validates it.
 2. Adds an NFD rule for the vendor-only NVIDIA GPU label without changing DPF's compound PCI
    labels, installs the NVIDIA GPU Operator via OLM, and creates the `ClusterPolicy`. GPU operands
    are configured to tolerate not-ready nodes and use the external API endpoint, host networking,
@@ -32,10 +49,12 @@ Design details live in [PLAN.md](PLAN.md).
    DaemonSet `llm-recipe-<arch>` (using `image_for`, `<type>-<arch>`) in namespace
    `llm-recipes`. The DaemonSet:
    - runs with `hostNetwork: true` (server on `https://<node-ip>:52395`),
-   - uses a dedicated service account granted the OpenShift `hostnetwork-v2` SCC,
+   - uses a dedicated service account and a narrowly scoped SCC permitting host networking, the
+     server port, and the node-local model cache,
    - requests every GPU on the node (`nvidia.com/gpu: N`),
    - mounts the recipe script from a ConfigMap at `/recipe/script.sh`,
-   - has `emptyDir`s at `/models`, `/certs` and a memory-backed `/dev/shm`.
+   - mounts a persistent node-local model cache at `/models`, with `emptyDir`s at `/certs` and a
+     memory-backed `/dev/shm`.
 5. Prints node IPs and commands for following both the reconciler and workload. Kubernetes keeps
    reconciling the controller objects after `run-recipe.sh` exits; recipe or server failures exit
    the workload container and remain visible in pod status.
@@ -50,6 +69,17 @@ Environment knobs:
 | `CSV_TIMEOUT` | seconds to wait for an operator CSV to install |
 | `RECONCILE_RESYNC` | safety resync period in seconds (default `300`); node changes reconcile immediately via an API watch |
 | `DRY_RUN=true` | render everything with `oc apply --dry-run=client` and skip the waits |
+| `REPO_URL` | manifest repository to clone (default: this GitHub repository over HTTPS) |
+| `REPO_REF` | branch or tag to clone (default `main`) |
+| `MODEL_CACHE_ROOT` | host directory for per-recipe model caches (default `/var/cache/llm-cluster-recipes/models`) |
+
+## Manifests
+
+Kubernetes resources live in [`manifests/`](manifests/) rather than being embedded in the runner.
+The checked-in files contain sensible placeholder values and remain valid YAML on their own;
+`run-recipe.sh` renders namespace, recipe, architecture, image, URL, and checksum values with `yq`
+before applying them. Dynamic recipe and DaemonSet content is loaded into the corresponding
+ConfigMap manifests from temporary files.
 
 Required flag:
 
@@ -66,12 +96,16 @@ never applied to the cluster.
 ```yaml
 name: my-model
 type: llama-cpp          # runtime key; combined with node arch to pick an image
+cacheKey: my-model-v1    # optional; bump when hosted model files change
 vars:                    # exported as env vars in the pod
   MODEL_NAME: org/model
 script: |                # runs inside the pod on every GPU node
   #!/usr/bin/env bash
   set -euo pipefail
-  wget -q "$RECIPE_BASE_URL/model.gguf" -O /models/model.gguf
+  if [ ! -s /models/model.gguf ]; then
+    wget -c "$RECIPE_BASE_URL/model.gguf" -O /models/model.gguf.part
+    mv /models/model.gguf.part /models/model.gguf
+  fi
   exec llama-server --host 0.0.0.0 --port "$PORT" --api-key "$API_KEY" \
     --ssl-key-file "$TLS_KEY" --ssl-cert-file "$TLS_CRT" -m /models/model.gguf -ngl 99
 ```
@@ -99,8 +133,21 @@ environment names, values must be scalar strings/numbers/booleans, and runner-ow
 `TLS_CRT`) cannot be overridden. Changing a recipe script changes the pod-template checksum and
 automatically rolls the DaemonSets.
 
+`cacheKey` defaults to the recipe name and selects the cache directory on every node. Bump it when
+the hosted model artifacts change. Recipe scripts should download to a `.part` file with resume
+enabled, then rename it into place only after a successful download. The included Qwen recipe has a
+reusable `fetch_cached` helper demonstrating this pattern.
+
 Registration (`--register-url`) is a required deployment setting passed to `run-recipe.sh`, not part
 of the recipe — the same recipe can be deployed against different routers.
+
+## Uninstalling
+
+`./run-recipe.sh uninstall` deletes the workload namespace selected by `NS`, its custom SCC, and
+its cluster-wide Node-reader RBAC. It intentionally preserves the shared NFD and NVIDIA GPU
+Operator installation. It also preserves model data under `MODEL_CACHE_ROOT` on every node, so a
+later deployment can reuse it. Remove those host directories separately when the cached weights
+are no longer needed.
 
 ## Images
 

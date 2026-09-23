@@ -5,6 +5,7 @@
 #
 # Usage: ./run-recipe.sh <http-url-to-recipe-folder> --register-url <https-url>
 #   e.g. ./run-recipe.sh https://host/recipes/qwen3.8-27B/ --register-url https://router/register
+#        ./run-recipe.sh uninstall
 #
 # --register-url: each pod POSTs {"host","port","api_key"} here once its server is healthy.
 #
@@ -42,6 +43,9 @@ PORT=52395
 CSV_TIMEOUT="${CSV_TIMEOUT:-600}"          # seconds to wait for an operator CSV
 RECONCILE_RESYNC="${RECONCILE_RESYNC:-300}"
 DRY_RUN="${DRY_RUN:-false}"                 # true -> skip cluster mutations, render only
+REPO_URL="${REPO_URL:-https://github.com/eelgaev/llm-cluster-recipes.git}"
+REPO_REF="${REPO_REF:-main}"
+MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT:-/var/cache/llm-cluster-recipes/models}"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
@@ -85,7 +89,28 @@ csv_succeeded() {
 # ----------------------------------------------------------------------------
 # 1. Args & preflight
 # ----------------------------------------------------------------------------
-usage() { die "usage: $0 <http-url-to-recipe-folder> --register-url <https-url>"; }
+usage() {
+  die "usage: $0 <http-url-to-recipe-folder> --register-url <https-url>
+       $0 uninstall"
+}
+
+if [ "${1:-}" = uninstall ]; then
+  shift
+  [ $# -eq 0 ] || usage
+  if ! [[ "$NS" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || [ "${#NS}" -gt 63 ]; then
+    die "NS must be a valid Kubernetes namespace name (got: $NS)"
+  fi
+  command -v oc >/dev/null 2>&1 || die "required tool not found: oc"
+  oc whoami >/dev/null 2>&1 || die "not logged in to a cluster (oc whoami failed)"
+  log "Uninstalling the LLM recipe workload from namespace $NS"
+  oc delete clusterrolebinding "llm-recipe-node-reader-$NS" --ignore-not-found
+  oc delete clusterrole "llm-recipe-node-reader-$NS" --ignore-not-found
+  oc delete securitycontextconstraints "llm-recipe-host-cache-$NS" --ignore-not-found
+  oc delete namespace "$NS" --ignore-not-found --wait=false
+  log "Uninstall submitted; the shared NFD/GPU Operator installation and node model cache were preserved"
+  exit 0
+fi
+
 BASE=""
 REGISTER_URL=""   # pods POST {host,port,api_key} here once healthy
 while [ $# -gt 0 ]; do
@@ -115,9 +140,15 @@ done
 if ! [[ "$NS" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || [ "${#NS}" -gt 63 ]; then
   die "NS must be a valid Kubernetes namespace name (got: $NS)"
 fi
+if ! [[ "$MODEL_CACHE_ROOT" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || [ "$MODEL_CACHE_ROOT" = / ] \
+    || [[ "/$MODEL_CACHE_ROOT/" == *"/../"* ]]; then
+  die "MODEL_CACHE_ROOT must be a non-root absolute path without '..' (got: $MODEL_CACHE_ROOT)"
+fi
+MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT%/}
 RECIPE_URL="$BASE/recipe.yaml"
 
-for tool in oc curl yq; do
+for tool in oc curl git yq; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
 done
 yq --version 2>/dev/null | grep -q 'mikefarah\|version v4' \
@@ -131,6 +162,29 @@ log "Logged in as $(oc whoami) on $(oc whoami --show-server)"
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 RECIPE="$WORKDIR/recipe.yaml"
+REPO_DIR="$WORKDIR/llm-cluster-recipes"
+
+log "Cloning manifests from $REPO_URL (ref: $REPO_REF)"
+git clone --quiet --depth 1 --branch "$REPO_REF" "$REPO_URL" "$REPO_DIR" \
+  || die "failed to clone $REPO_URL at ref $REPO_REF"
+MANIFEST_DIR="$REPO_DIR/manifests"
+[ -d "$MANIFEST_DIR" ] || die "cloned repository does not contain a manifests directory"
+REQUIRED_MANIFESTS="
+cluster-policy.yaml
+gpu-operator.yaml
+nfd-gpu-rule.yaml
+recipe-script-configmap.yaml
+reconciler-code.yaml
+reconciler-deployment.yaml
+reconciler-template-configmap.yaml
+workload-access.yaml
+workload-daemonset.yaml
+"
+for manifest in $REQUIRED_MANIFESTS; do
+  [ -f "$MANIFEST_DIR/$manifest" ] || die "required manifest not found: manifests/$manifest"
+  yq -e '.' "$MANIFEST_DIR/$manifest" >/dev/null 2>&1 \
+    || die "manifest is not valid YAML: manifests/$manifest"
+done
 
 log "Fetching recipe from $RECIPE_URL"
 curl -fsSL "$RECIPE_URL" -o "$RECIPE" || die "failed to fetch $RECIPE_URL"
@@ -145,12 +199,16 @@ yq -e '(.script | type == "!!str") and (.script | length > 0)' "$RECIPE" >/dev/n
   || die "recipe script must be a non-empty multiline string"
 yq -e '(.vars == null) or ((.vars | type) == "!!map")' "$RECIPE" >/dev/null 2>&1 \
   || die "recipe vars must be a mapping"
+yq -e '(.cacheKey == null) or ((.cacheKey | type) == "!!str" and (.cacheKey | length) > 0)' \
+  "$RECIPE" >/dev/null 2>&1 \
+  || die "recipe cacheKey must be a non-empty string"
 yq -e '(.vars // {}) | keys | map(select(test("^[A-Za-z_][A-Za-z0-9_]*$") | not)) | length == 0' \
   "$RECIPE" >/dev/null 2>&1 \
   || die "recipe var names must be portable environment variable names"
 
 RECIPE_NAME=$(yq -r '.name' "$RECIPE")
 RECIPE_TYPE=$(yq -r '.type' "$RECIPE")
+CACHE_KEY=$(yq -r '.cacheKey // .name' "$RECIPE")
 if ! [[ "$RECIPE_NAME" =~ ^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$ ]] \
     || [ "${#RECIPE_NAME}" -gt 63 ]; then
   die "recipe name must be a valid Kubernetes label value of at most 63 characters"
@@ -158,6 +216,11 @@ fi
 if ! [[ "$RECIPE_TYPE" =~ ^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$ ]]; then
   die "recipe type contains unsupported characters: $RECIPE_TYPE"
 fi
+if ! [[ "$CACHE_KEY" =~ ^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$ ]] \
+    || [ "${#CACHE_KEY}" -gt 128 ]; then
+  die "recipe cacheKey must be a safe path segment of at most 128 characters"
+fi
+MODEL_CACHE_PATH="$MODEL_CACHE_ROOT/$CACHE_KEY"
 
 RESERVED_VARS=" RECIPE_BASE_URL PORT REGISTER_URL NODE_NAME NODE_HOST_IP API_KEY TLS_KEY TLS_CRT "
 while IFS= read -r var_type; do
@@ -175,6 +238,7 @@ if yq -e '.image' "$RECIPE" >/dev/null 2>&1; then
   warn "recipe declares image — ignored; images come from image_for() by type+arch"
 fi
 log "Recipe '$RECIPE_NAME' type=$RECIPE_TYPE"
+log "Model cache: $MODEL_CACHE_PATH on each GPU node"
 log "Pods will register at $REGISTER_URL once healthy"
 
 # ----------------------------------------------------------------------------
@@ -191,23 +255,8 @@ configure_nfd_gpu_label() {
 
   # DPF relies on compound PCI labels (class_vendor_device). Add the vendor-only
   # label required by the NVIDIA GPU Operator without changing DPF's NFD config.
-  oc_apply <<EOF
-apiVersion: nfd.openshift.io/v1alpha1
-kind: NodeFeatureRule
-metadata:
-  name: llm-nvidia-gpu-detection
-  namespace: $NFD_NS
-spec:
-  rules:
-    - name: NVIDIA GPU detection
-      labels:
-        "pci-10de.present": "true"
-      matchFeatures:
-        - feature: pci.device
-          matchExpressions:
-            vendor: {op: In, value: ["10de"]}
-            class: {op: InRegexp, value: ["^03"]}
-EOF
+  NFD_NS="$NFD_NS" yq '.metadata.namespace = strenv(NFD_NS)' \
+    "$MANIFEST_DIR/nfd-gpu-rule.yaml" | oc_apply
 }
 
 install_gpu_operator() {
@@ -217,33 +266,12 @@ install_gpu_operator() {
     -o jsonpath='{.status.defaultChannel}' 2>/dev/null || true)
   [ -n "$channel" ] || { warn "could not read default channel for gpu-operator-certified; using 'stable'"; channel=stable; }
 
-  oc_apply <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $GPU_NS
----
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: nvidia-gpu-operator-group
-  namespace: $GPU_NS
-spec:
-  targetNamespaces:
-    - $GPU_NS
----
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: gpu-operator-certified
-  namespace: $GPU_NS
-spec:
-  channel: "$channel"
-  name: gpu-operator-certified
-  source: certified-operators
-  sourceNamespace: openshift-marketplace
-  installPlanApproval: Automatic
-EOF
+  GPU_NS="$GPU_NS" CHANNEL="$channel" yq '
+    (select(.kind == "Namespace").metadata.name) = strenv(GPU_NS) |
+    (select(.kind != "Namespace").metadata.namespace) = strenv(GPU_NS) |
+    (select(.kind == "OperatorGroup").spec.targetNamespaces) = [strenv(GPU_NS)] |
+    (select(.kind == "Subscription").spec.channel) = strenv(CHANNEL)
+  ' "$MANIFEST_DIR/gpu-operator.yaml" | oc_apply
   [ "$DRY_RUN" = true ] && return
   wait_for "$CSV_TIMEOUT" "GPU Operator CSV Succeeded" csv_succeeded "$GPU_NS" gpu-operator-certified
 
@@ -260,34 +288,7 @@ EOF
       oc_apply < "$cp"
     else
       log "Creating minimal ClusterPolicy"
-      oc_apply <<EOF
-apiVersion: nvidia.com/v1
-kind: ClusterPolicy
-metadata:
-  name: gpu-cluster-policy
-spec:
-  operator:
-    defaultRuntime: crio
-  driver:
-    enabled: true
-  toolkit:
-    enabled: true
-  devicePlugin:
-    enabled: true
-  dcgmExporter:
-    enabled: true
-  gfd:
-    enabled: true
-  migManager:
-    enabled: true
-  nodeStatusExporter:
-    enabled: true
-  validator:
-    plugin:
-      env:
-        - name: WITH_WORKLOAD
-          value: "true"
-EOF
+      oc_apply < "$MANIFEST_DIR/cluster-policy.yaml"
     fi
   fi
 
@@ -419,207 +420,58 @@ log "GPU node groups:"
 # 5. Render workloads
 # ----------------------------------------------------------------------------
 log "Creating namespace $NS and recipe ConfigMap"
-oc_apply <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $NS
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: $WORKLOAD_SA
-  namespace: $NS
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: llm-recipe-reconciler
-  namespace: $NS
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: llm-recipe-use-hostnetwork-v2
-  namespace: $NS
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:openshift:scc:hostnetwork-v2
-subjects:
-  - kind: ServiceAccount
-    name: $WORKLOAD_SA
-    namespace: $NS
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: llm-recipe-node-reader-$NS
-rules:
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: llm-recipe-node-reader-$NS
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: llm-recipe-node-reader-$NS
-subjects:
-  - kind: ServiceAccount
-    name: llm-recipe-reconciler
-    namespace: $NS
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: llm-recipe-daemonset-reconciler
-  namespace: $NS
-rules:
-  - apiGroups: ["apps"]
-    resources: ["daemonsets"]
-    verbs: ["get", "create", "patch", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: llm-recipe-daemonset-reconciler
-  namespace: $NS
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: llm-recipe-daemonset-reconciler
-subjects:
-  - kind: ServiceAccount
-    name: llm-recipe-reconciler
-    namespace: $NS
-EOF
+NS="$NS" WORKLOAD_SA="$WORKLOAD_SA" yq '
+  (select(.kind == "Namespace").metadata.name) = strenv(NS) |
+  (select(.kind != "Namespace" and .kind != "ClusterRole" and .kind != "ClusterRoleBinding" and .kind != "SecurityContextConstraints").metadata.namespace) = strenv(NS) |
+  (select(.kind == "ServiceAccount" and .metadata.name == "llm-recipe").metadata.name) = strenv(WORKLOAD_SA) |
+  (select(.kind == "SecurityContextConstraints").metadata.name) = ("llm-recipe-host-cache-" + strenv(NS)) |
+  (select(.kind == "RoleBinding" and .metadata.name == "llm-recipe-use-host-cache").roleRef.name) = ("system:openshift:scc:llm-recipe-host-cache-" + strenv(NS)) |
+  (select(.kind == "RoleBinding" and .metadata.name == "llm-recipe-use-host-cache").subjects[0].name) = strenv(WORKLOAD_SA) |
+  (select(.kind == "RoleBinding" and .metadata.name == "llm-recipe-use-host-cache").subjects[0].namespace) = strenv(NS) |
+  (select(.kind == "ClusterRole").metadata.name) = ("llm-recipe-node-reader-" + strenv(NS)) |
+  (select(.kind == "ClusterRoleBinding").metadata.name) = ("llm-recipe-node-reader-" + strenv(NS)) |
+  (select(.kind == "ClusterRoleBinding").roleRef.name) = ("llm-recipe-node-reader-" + strenv(NS)) |
+  (select(.kind == "ClusterRoleBinding").subjects[0].namespace) = strenv(NS) |
+  (select(.kind == "RoleBinding" and .metadata.name == "llm-recipe-daemonset-reconciler").subjects[0].namespace) = strenv(NS)
+' "$MANIFEST_DIR/workload-access.yaml" | oc_apply
 
-# ConfigMap: recipe script — let oc do the multiline quoting
+# ConfigMap: recipe script
 yq '.script' "$RECIPE" > "$WORKDIR/script.sh"
 read -r script_crc script_bytes _ < <(cksum < "$WORKDIR/script.sh")
 SCRIPT_CHECKSUM="${script_crc}-${script_bytes}"
-oc create configmap llm-recipe-script -n "$NS" \
-    --from-file=script.sh="$WORKDIR/script.sh" --dry-run=client -o yaml \
-  | RECIPE_NAME="$RECIPE_NAME" yq '.metadata.labels = {"app":"llm-recipe","recipe": strenv(RECIPE_NAME)}' \
-  | oc_apply
-
-# Append the recipe's `vars` map to the container env of a DaemonSet read on stdin.
-add_recipe_vars() {
-  RECIPE="$RECIPE" yq '
-    .spec.template.spec.containers[0].env +=
-      (load(strenv(RECIPE)).vars // {} | to_entries | map({"name": .key, "value": (.value | tostring)}))'
-}
+NS="$NS" RECIPE_NAME="$RECIPE_NAME" SCRIPT_FILE="$WORKDIR/script.sh" yq '
+  .metadata.namespace = strenv(NS) |
+  .metadata.labels.recipe = strenv(RECIPE_NAME) |
+  .data."script.sh" = load_str(strenv(SCRIPT_FILE))
+' "$MANIFEST_DIR/recipe-script-configmap.yaml" | oc_apply
 
 render_daemonset() {
   local arch=$1 gpus=$2 image=$3 k8s_arch=$4
-  cat <<EOF
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: llm-recipe-$arch
-  namespace: $NS
-  labels:
-    app: llm-recipe
-    recipe: $RECIPE_NAME
-    arch: $arch
-spec:
-  selector:
-    matchLabels:
-      app: llm-recipe
-      arch: $arch
-  updateStrategy:
-    type: RollingUpdate
-  template:
-    metadata:
-      labels:
-        app: llm-recipe
-        recipe: $RECIPE_NAME
-        arch: $arch
-      annotations:
-        llm-recipes.openai.com/script-checksum: "$SCRIPT_CHECKSUM"
-    spec:
-      serviceAccountName: $WORKLOAD_SA
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector:
-        feature.node.kubernetes.io/pci-10de.present: "true"
-        kubernetes.io/arch: $k8s_arch
-      tolerations:
-        - key: nvidia.com/gpu
-          operator: Exists
-          effect: NoSchedule
-      containers:
-        - name: llm
-          image: $image
-          imagePullPolicy: Always
-          command: ["/usr/local/bin/entrypoint.sh"]
-          env:
-            - name: RECIPE_BASE_URL
-              value: "$BASE"
-            - name: PORT
-              value: "$PORT"
-            - name: REGISTER_URL
-              value: "$REGISTER_URL"
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: NODE_HOST_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.hostIP
-          ports:
-            - name: https
-              containerPort: $PORT
-              hostPort: $PORT
-              protocol: TCP
-          startupProbe:
-            exec:
-              command:
-                - /bin/bash
-                - -c
-                - 'curl -ksf -H "Authorization: Bearer \${API_KEY}" "https://127.0.0.1:\${PORT}/health" >/dev/null'
-            periodSeconds: 5
-            timeoutSeconds: 3
-            failureThreshold: 360
-          readinessProbe:
-            exec:
-              command:
-                - /bin/bash
-                - -c
-                - 'curl -ksf -H "Authorization: Bearer \${API_KEY}" "https://127.0.0.1:\${PORT}/health" >/dev/null'
-            periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
-          resources:
-            limits:
-              nvidia.com/gpu: "$gpus"
-          volumeMounts:
-            - name: recipe
-              mountPath: /recipe
-            - name: models
-              mountPath: /models
-            - name: certs
-              mountPath: /certs
-            - name: shm
-              mountPath: /dev/shm
-      volumes:
-        - name: recipe
-          configMap:
-            name: llm-recipe-script
-            defaultMode: 0755
-        - name: models
-          emptyDir: {}
-        - name: certs
-          emptyDir: {}
-        - name: shm
-          emptyDir:
-            medium: Memory
-EOF
+  NS="$NS" WORKLOAD_SA="$WORKLOAD_SA" RECIPE_NAME="$RECIPE_NAME" \
+    SCRIPT_CHECKSUM="$SCRIPT_CHECKSUM" ARCH="$arch" GPU_COUNT="$gpus" \
+    IMAGE="$image" K8S_ARCH="$k8s_arch" BASE="$BASE" PORT="$PORT" \
+    REGISTER_URL="$REGISTER_URL" RECIPE="$RECIPE" MODEL_CACHE_PATH="$MODEL_CACHE_PATH" yq '
+      .metadata.name = ("llm-recipe-" + strenv(ARCH)) |
+      .metadata.namespace = strenv(NS) |
+      .metadata.labels.recipe = strenv(RECIPE_NAME) |
+      .metadata.labels.arch = strenv(ARCH) |
+      .spec.selector.matchLabels.arch = strenv(ARCH) |
+      .spec.template.metadata.labels.recipe = strenv(RECIPE_NAME) |
+      .spec.template.metadata.labels.arch = strenv(ARCH) |
+      .spec.template.metadata.annotations."llm-recipes.openai.com/script-checksum" = strenv(SCRIPT_CHECKSUM) |
+      .spec.template.spec.serviceAccountName = strenv(WORKLOAD_SA) |
+      .spec.template.spec.nodeSelector."kubernetes.io/arch" = strenv(K8S_ARCH) |
+      .spec.template.spec.containers[0].image = strenv(IMAGE) |
+      (.spec.template.spec.containers[0].env[] | select(.name == "RECIPE_BASE_URL").value) = strenv(BASE) |
+      (.spec.template.spec.containers[0].env[] | select(.name == "PORT").value) = strenv(PORT) |
+      (.spec.template.spec.containers[0].env[] | select(.name == "REGISTER_URL").value) = strenv(REGISTER_URL) |
+      .spec.template.spec.containers[0].ports[0].containerPort = env(PORT) |
+      .spec.template.spec.containers[0].ports[0].hostPort = env(PORT) |
+      .spec.template.spec.containers[0].resources.limits."nvidia.com/gpu" = strenv(GPU_COUNT) |
+      (.spec.template.spec.volumes[] | select(.name == "models").hostPath.path) = strenv(MODEL_CACHE_PATH) |
+      .spec.template.spec.containers[0].env +=
+        (load(strenv(RECIPE)).vars // {} | to_entries | map({"name": .key, "value": (.value | tostring)}))
+    ' "$MANIFEST_DIR/workload-daemonset.yaml"
 }
 
 CLI_IMAGE="quay.io/openshift/origin-cli:latest"
@@ -630,57 +482,8 @@ fi
 
 # This controller-side loop is deliberately stored in-cluster. The invoking
 # shell can exit while it waits for every matching node to advertise capacity.
-yq e ".metadata.namespace = \"$NS\"" - <<'EOF' | oc_apply
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: llm-recipe-reconciler-code
-  namespace: llm-recipes-placeholder
-data:
-  reconcile.sh: |
-    #!/usr/bin/env bash
-    set -uo pipefail
-
-    selector="feature.node.kubernetes.io/pci-10de.present=true,kubernetes.io/arch=${K8S_ARCH}"
-    previous=""
-    while :; do
-      capacities=$(oc get nodes -l "$selector" \
-        -o go-template='{{range .items}}{{index .status.capacity "nvidia.com/gpu"}}{{"\n"}}{{end}}' \
-        2>/dev/null || true)
-      summary=$(awk '
-        BEGIN { ok=1; count=0; min=0; distinct="" }
-        /^[1-9][0-9]*$/ {
-          value=$1+0; count++
-          if (min == 0 || value < min) min=value
-          if (!(value in seen)) { seen[value]=1; distinct=distinct " " value }
-          next
-        }
-        { ok=0 }
-        END { if (ok && count > 0) print min ":" count ":" distinct }
-      ' <<<"$capacities")
-
-      if [[ "$summary" =~ ^([1-9][0-9]*):([1-9][0-9]*):(.*)$ ]]; then
-        gpus=${BASH_REMATCH[1]}
-        nodes=${BASH_REMATCH[2]}
-        counts=${BASH_REMATCH[3]}
-        if [ "$summary" != "$previous" ]; then
-          echo "GPU capacity available on $nodes $K8S_ARCH node(s); using $gpus GPU(s) per pod (reported:$counts)"
-          previous=$summary
-        fi
-        sed "s/__GPU_COUNT__/$gpus/g" /template/daemonset.yaml > /tmp/daemonset.yaml
-        oc apply -n "$TARGET_NAMESPACE" -f /tmp/daemonset.yaml >/dev/null \
-          || echo "Could not reconcile $DS_NAME; retrying" >&2
-      elif [ "$previous" != waiting ]; then
-        echo "Waiting for every matching $K8S_ARCH GPU node to advertise nvidia.com/gpu capacity"
-        previous=waiting
-      fi
-      # React immediately to node status/label changes. The request timeout is
-      # only a slow safety resync in case the DaemonSet is changed or deleted
-      # without a corresponding node event.
-      oc --request-timeout="${RECONCILE_RESYNC}s" get nodes -l "$selector" \
-        --watch-only -o name 2>/dev/null | head -n 1 >/dev/null || true
-    done
-EOF
+NS="$NS" yq '.metadata.namespace = strenv(NS)' \
+  "$MANIFEST_DIR/reconciler-code.yaml" | oc_apply
 
 DEPLOYED_ARCHES=
 while read -r k8s_arch; do
@@ -697,67 +500,32 @@ while read -r k8s_arch; do
   # Keep a complete DaemonSet template in a ConfigMap. The placeholder is
   # replaced only after node status contains a numeric GPU capacity.
   ds_template="$WORKDIR/daemonset-$arch.yaml"
-  render_daemonset "$arch" "__GPU_COUNT__" "$image" "$k8s_arch" | add_recipe_vars > "$ds_template"
+  render_daemonset "$arch" "__GPU_COUNT__" "$image" "$k8s_arch" > "$ds_template"
   read -r template_crc template_bytes _ < <(cksum < "$ds_template")
   template_checksum="${template_crc}-${template_bytes}"
 
   log "Creating in-cluster reconciler for llm-recipe-$arch (image=$image)"
-  oc create configmap "llm-recipe-reconciler-$arch" -n "$NS" \
-      --from-file=daemonset.yaml="$ds_template" --dry-run=client -o yaml \
-    | oc_apply
+  NS="$NS" ARCH="$arch" DS_TEMPLATE="$ds_template" yq '
+    .metadata.name = ("llm-recipe-reconciler-" + strenv(ARCH)) |
+    .metadata.namespace = strenv(NS) |
+    .data."daemonset.yaml" = load_str(strenv(DS_TEMPLATE))
+  ' "$MANIFEST_DIR/reconciler-template-configmap.yaml" | oc_apply
 
-  oc_apply <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: llm-recipe-reconciler-$arch
-  namespace: $NS
-  labels:
-    app: llm-recipe-reconciler
-    arch: $arch
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: llm-recipe-reconciler
-      arch: $arch
-  template:
-    metadata:
-      labels:
-        app: llm-recipe-reconciler
-        arch: $arch
-      annotations:
-        llm-recipes.openai.com/template-checksum: "$template_checksum"
-    spec:
-      serviceAccountName: llm-recipe-reconciler
-      containers:
-        - name: reconciler
-          image: $CLI_IMAGE
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/bash", "/reconciler/reconcile.sh"]
-          env:
-            - name: TARGET_NAMESPACE
-              value: "$NS"
-            - name: K8S_ARCH
-              value: "$k8s_arch"
-            - name: DS_NAME
-              value: "llm-recipe-$arch"
-            - name: RECONCILE_RESYNC
-              value: "$RECONCILE_RESYNC"
-          volumeMounts:
-            - name: template
-              mountPath: /template
-            - name: reconciler
-              mountPath: /reconciler
-      volumes:
-        - name: template
-          configMap:
-            name: llm-recipe-reconciler-$arch
-        - name: reconciler
-          configMap:
-            name: llm-recipe-reconciler-code
-            defaultMode: 0755
-EOF
+  NS="$NS" ARCH="$arch" K8S_ARCH="$k8s_arch" CLI_IMAGE="$CLI_IMAGE" \
+    TEMPLATE_CHECKSUM="$template_checksum" RECONCILE_RESYNC="$RECONCILE_RESYNC" yq '
+      .metadata.name = ("llm-recipe-reconciler-" + strenv(ARCH)) |
+      .metadata.namespace = strenv(NS) |
+      .metadata.labels.arch = strenv(ARCH) |
+      .spec.selector.matchLabels.arch = strenv(ARCH) |
+      .spec.template.metadata.labels.arch = strenv(ARCH) |
+      .spec.template.metadata.annotations."llm-recipes.openai.com/template-checksum" = strenv(TEMPLATE_CHECKSUM) |
+      .spec.template.spec.containers[0].image = strenv(CLI_IMAGE) |
+      (.spec.template.spec.containers[0].env[] | select(.name == "TARGET_NAMESPACE").value) = strenv(NS) |
+      (.spec.template.spec.containers[0].env[] | select(.name == "K8S_ARCH").value) = strenv(K8S_ARCH) |
+      (.spec.template.spec.containers[0].env[] | select(.name == "DS_NAME").value) = ("llm-recipe-" + strenv(ARCH)) |
+      (.spec.template.spec.containers[0].env[] | select(.name == "RECONCILE_RESYNC").value) = strenv(RECONCILE_RESYNC) |
+      .spec.template.spec.volumes[0].configMap.name = ("llm-recipe-reconciler-" + strenv(ARCH))
+    ' "$MANIFEST_DIR/reconciler-deployment.yaml" | oc_apply
   DEPLOYED_ARCHES="$DEPLOYED_ARCHES $arch"
 done <<<"$ARCH_GROUPS"
 

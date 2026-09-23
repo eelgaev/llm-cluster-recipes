@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-recipe-reconciler-arch
+  namespace: llm-recipes
+data:
+  daemonset.yaml: |
+    # Replaced with the rendered workload DaemonSet by run-recipe.sh.

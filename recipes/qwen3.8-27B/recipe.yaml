@@ -1,5 +1,6 @@
 name: qwen3-27b
 type: llama-cpp        # runtime; run-recipe.sh maps type + node arch -> image
+cacheKey: qwen3.8-27B-q4-v1  # bump when the hosted model files change
 vars:
   MODEL_NAME: unsloth/Qwen3.8-27B
 script: |
@@ -8,11 +9,22 @@ script: |
   export GGML_CUDA_P2P=1 GGML_CUDA_REGISTER_HOST=1 GGML_OP_OFFLOAD_MIN_BATCH=1
   export GGML_CUDA_GRAPH_OPT=1 GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 
-  # weights + chat template are hosted next to recipe.yaml (RECIPE_BASE_URL)
-  wget -q "$RECIPE_BASE_URL/Qwen3.8-27B-UD-Q4_K_XL.gguf" -O /models/model.gguf
-  wget -q "$RECIPE_BASE_URL/mtp-Qwen3.8-27B-Q4_0.gguf"   -O /models/mtp.gguf
-  wget -q "$RECIPE_BASE_URL/mmproj-BF16.gguf"             -O /models/mmproj.gguf
-  wget -q "$RECIPE_BASE_URL/chat_template.jinja"          -O /models/chat_template.jinja
+  # Files remain in the node-local /models cache across pod restarts. Downloads
+  # resume through .part files and are renamed only after they complete.
+  fetch_cached() {
+    local source=$1 destination=$2 partial="${2}.part"
+    if [ -s "$destination" ]; then
+      echo "cache hit: $destination"
+      return
+    fi
+    wget -c "$source" -O "$partial"
+    mv "$partial" "$destination"
+  }
+
+  fetch_cached "$RECIPE_BASE_URL/Qwen3.8-27B-UD-Q4_K_XL.gguf" /models/model.gguf
+  fetch_cached "$RECIPE_BASE_URL/mtp-Qwen3.8-27B-Q4_0.gguf" /models/mtp.gguf
+  fetch_cached "$RECIPE_BASE_URL/mmproj-BF16.gguf" /models/mmproj.gguf
+  fetch_cached "$RECIPE_BASE_URL/chat_template.jinja" /models/chat_template.jinja
 
   exec llama-server \
       --host 0.0.0.0 --port "$PORT" \

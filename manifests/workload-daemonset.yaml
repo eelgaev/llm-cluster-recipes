@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: llm-recipe-arch
+  namespace: llm-recipes
+  labels:
+    app: llm-recipe
+    recipe: recipe-placeholder
+    arch: arch-placeholder
+spec:
+  selector:
+    matchLabels:
+      app: llm-recipe
+      arch: arch-placeholder
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: llm-recipe
+        recipe: recipe-placeholder
+        arch: arch-placeholder
+      annotations:
+        llm-recipes.openai.com/script-checksum: checksum-placeholder
+    spec:
+      serviceAccountName: llm-recipe
+      hostNetwork: true
+      dnsPolicy: Default
+      nodeSelector:
+        feature.node.kubernetes.io/pci-10de.present: "true"
+        kubernetes.io/arch: arch-placeholder
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: llm
+          image: image-placeholder
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/entrypoint.sh"]
+          env:
+            - name: RECIPE_BASE_URL
+              value: https://recipe.invalid
+            - name: PORT
+              value: "52395"
+            - name: REGISTER_URL
+              value: https://register.invalid
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          ports:
+            - name: https
+              containerPort: 52395
+              hostPort: 52395
+              protocol: TCP
+          startupProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - 'curl -ksf -H "Authorization: Bearer ${API_KEY}" "https://127.0.0.1:${PORT}/health" >/dev/null'
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 360
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - 'curl -ksf -H "Authorization: Bearer ${API_KEY}" "https://127.0.0.1:${PORT}/health" >/dev/null'
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            limits:
+              nvidia.com/gpu: "__GPU_COUNT__"
+          volumeMounts:
+            - name: recipe
+              mountPath: /recipe
+            - name: models
+              mountPath: /models
+            - name: certs
+              mountPath: /certs
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: recipe
+          configMap:
+            name: llm-recipe-script
+            defaultMode: 0755
+        - name: models
+          hostPath:
+            path: /var/cache/llm-cluster-recipes/models/recipe-placeholder
+            type: DirectoryOrCreate
+        - name: certs
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory

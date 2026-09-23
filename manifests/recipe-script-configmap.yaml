@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-recipe-script
+  namespace: llm-recipes
+  labels:
+    app: llm-recipe
+    recipe: recipe-placeholder
+data:
+  script.sh: |
+    # Replaced from recipe.yaml by run-recipe.sh.

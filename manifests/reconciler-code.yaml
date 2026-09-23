@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-recipe-reconciler-code
+  namespace: llm-recipes
+data:
+  reconcile.sh: |
+    #!/usr/bin/env bash
+    set -uo pipefail
+
+    selector="feature.node.kubernetes.io/pci-10de.present=true,kubernetes.io/arch=${K8S_ARCH}"
+    previous=""
+    while :; do
+      capacities=$(oc get nodes -l "$selector" \
+        -o go-template='{{range .items}}{{index .status.capacity "nvidia.com/gpu"}}{{"\n"}}{{end}}' \
+        2>/dev/null || true)
+      summary=$(awk '
+        BEGIN { ok=1; count=0; min=0; distinct="" }
+        /^[1-9][0-9]*$/ {
+          value=$1+0; count++
+          if (min == 0 || value < min) min=value
+          if (!(value in seen)) { seen[value]=1; distinct=distinct " " value }
+          next
+        }
+        { ok=0 }
+        END { if (ok && count > 0) print min ":" count ":" distinct }
+      ' <<<"$capacities")
+
+      if [[ "$summary" =~ ^([1-9][0-9]*):([1-9][0-9]*):(.*)$ ]]; then
+        gpus=${BASH_REMATCH[1]}
+        nodes=${BASH_REMATCH[2]}
+        counts=${BASH_REMATCH[3]}
+        if [ "$summary" != "$previous" ]; then
+          echo "GPU capacity available on $nodes $K8S_ARCH node(s); using $gpus GPU(s) per pod (reported:$counts)"
+          previous=$summary
+        fi
+        sed "s/__GPU_COUNT__/$gpus/g" /template/daemonset.yaml > /tmp/daemonset.yaml
+        oc apply -n "$TARGET_NAMESPACE" -f /tmp/daemonset.yaml >/dev/null \
+          || echo "Could not reconcile $DS_NAME; retrying" >&2
+      elif [ "$previous" != waiting ]; then
+        echo "Waiting for every matching $K8S_ARCH GPU node to advertise nvidia.com/gpu capacity"
+        previous=waiting
+      fi
+      # React immediately to node status/label changes. The request timeout is
+      # only a slow safety resync in case the DaemonSet is changed or deleted
+      # without a corresponding node event.
+      oc --request-timeout="${RECONCILE_RESYNC}s" get nodes -l "$selector" \
+        --watch-only -o name 2>/dev/null | head -n 1 >/dev/null || true
+    done
