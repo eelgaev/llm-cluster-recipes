@@ -103,10 +103,43 @@ wait_for() {
 }
 
 csv_succeeded() {
-  local ns=$1 pkg=$2 csv
-  csv=$(oc get subscription "$pkg" -n "$ns" -o jsonpath='{.status.installedCSV}' 2>/dev/null) || return 1
+  local ns=$1 pkg=$2 csv phase
+  csv=$(oc --request-timeout=30s get subscription "$pkg" -n "$ns" -o jsonpath='{.status.installedCSV}' 2>/dev/null) || return 1
   [ -n "$csv" ] || return 1
-  [ "$(oc get csv "$csv" -n "$ns" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Succeeded" ]
+  phase=$(oc --request-timeout=30s get csv "$csv" -n "$ns" -o jsonpath='{.status.phase}' 2>/dev/null) || return 1
+  case "$phase" in Succeeded) return 0 ;; Failed) return 2 ;; *) return 1 ;; esac
+}
+
+wait_for_csv() {
+  local ns=$1 pkg=$2 start now next_report=0 status result csv
+  start=$(date +%s)
+  log "Waiting up to ${CSV_TIMEOUT}s for $pkg CSV to succeed in $ns"
+  while :; do
+    if csv_succeeded "$ns" "$pkg"; then break; else result=$?; fi
+    if [ "$result" -eq 2 ]; then
+      csv=$(oc --request-timeout=15s get subscription "$pkg" -n "$ns" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+      warn "$pkg CSV ${csv:-unknown} is Failed; OLM state follows:"
+      oc --request-timeout=15s get subscription,csv,installplan,pods -n "$ns" -o wide >&2 || true
+      [ -z "$csv" ] || oc --request-timeout=15s describe csv "$csv" -n "$ns" 2>&1 | tail -40 >&2 || true
+      die "$pkg CSV failed in $ns"
+    fi
+    now=$(date +%s)
+    if (( now - start >= CSV_TIMEOUT )); then
+      warn "$pkg did not install within ${CSV_TIMEOUT}s; OLM state follows:"
+      oc --request-timeout=15s get subscription,csv,installplan,pods -n "$ns" -o wide >&2 || true
+      oc --request-timeout=15s describe subscription "$pkg" -n "$ns" >&2 || true
+      die "timed out waiting for $pkg CSV Succeeded"
+    fi
+    if (( now >= next_report )); then
+      status=$(oc --request-timeout=15s get subscription "$pkg" -n "$ns" \
+        -o jsonpath='{.status.state}{" currentCSV="}{.status.currentCSV}{" installedCSV="}{.status.installedCSV}{" installPlan="}{.status.installPlanRef.name}{" conditions="}{range .status.conditions[*]}{.type}{"="}{.status}{":"}{.reason}{"; "}{end}' 2>&1) \
+        || status="could not read Subscription: $status"
+      log "$pkg OLM status: ${status:-pending}"
+      next_report=$((now + 30))
+    fi
+    sleep 5
+  done
+  log "$pkg CSV Succeeded"
 }
 
 # ----------------------------------------------------------------------------
@@ -334,7 +367,7 @@ configure_nfd_gpu_label() {
       ' "$MANIFEST_DIR/nfd-operator.yaml" | oc_apply
     fi
     if [ "$DRY_RUN" != true ]; then
-      wait_for "$CSV_TIMEOUT" "NFD operator CSV Succeeded" csv_succeeded "$NFD_NS" nfd
+      wait_for_csv "$NFD_NS" nfd
       # An installer may have created the instance while OLM was starting.
       instances=$(oc --request-timeout=30s get nodefeaturediscovery -n "$NFD_NS" -o name) \
         || die "could not inspect existing NFD configuration"
@@ -357,22 +390,47 @@ configure_nfd_gpu_label() {
 
 install_gpu_operator() {
   log "Installing NVIDIA GPU Operator"
-  local channel
-  channel=$(oc get packagemanifest gpu-operator-certified -n openshift-marketplace \
-    -o jsonpath='{.status.defaultChannel}' 2>/dev/null || true)
-  [ -n "$channel" ] || { warn "could not read default channel for gpu-operator-certified; using 'stable'"; channel=stable; }
+  local channel subscriptions operatorgroups create_operatorgroup=true
+  GPU_SUBSCRIPTION=gpu-operator-certified
+  subscriptions=""
+  operatorgroups=""
+  if [ "$DRY_RUN" != true ]; then
+    subscriptions=$(oc --request-timeout=30s get subscriptions -A -o json | \
+      GPU_NS="$GPU_NS" yq -p json -r '.items[] | select(.metadata.namespace == strenv(GPU_NS) and .spec.name == "gpu-operator-certified") | .metadata.name') \
+      || die "could not inspect existing GPU Operator subscriptions"
+    operatorgroups=$(oc --request-timeout=30s get operatorgroups -A -o json | \
+      GPU_NS="$GPU_NS" yq -p json -r '.items[] | select(.metadata.namespace == strenv(GPU_NS)) | .metadata.name') \
+      || die "could not inspect existing GPU Operator groups"
+    if [ -n "$operatorgroups" ]; then
+      [ "$(printf '%s\n' "$operatorgroups" | wc -l | tr -d ' ')" -eq 1 ] \
+        || die "multiple OperatorGroups in $GPU_NS: $operatorgroups; keep one before rerunning"
+      create_operatorgroup=false
+    fi
+  fi
+  if [ -n "$subscriptions" ]; then
+    [ "$(printf '%s\n' "$subscriptions" | wc -l | tr -d ' ')" -eq 1 ] \
+      || die "multiple GPU Operator subscriptions in $GPU_NS: $subscriptions; keep one before rerunning"
+    GPU_SUBSCRIPTION=$subscriptions
+    log "Reusing existing GPU Operator subscription $GPU_SUBSCRIPTION in $GPU_NS"
+  else
+    [ -z "$operatorgroups" ] || log "Reusing existing OperatorGroup $operatorgroups in $GPU_NS"
+    channel=$(oc get packagemanifest gpu-operator-certified -n openshift-marketplace \
+      -o jsonpath='{.status.defaultChannel}' 2>/dev/null || true)
+    [ -n "$channel" ] || { warn "could not read default channel for gpu-operator-certified; using 'stable'"; channel=stable; }
 
-  GPU_NS="$GPU_NS" CHANNEL="$channel" yq '
-    (select(.kind == "Namespace").metadata.name) = strenv(GPU_NS) |
-    (select(.kind != "Namespace").metadata.namespace) = strenv(GPU_NS) |
-    (select(.kind == "OperatorGroup").spec.targetNamespaces) = [strenv(GPU_NS)] |
-    (select(.kind == "Subscription").spec.channel) = strenv(CHANNEL)
-  ' "$MANIFEST_DIR/gpu-operator.yaml" | oc_apply
+    GPU_NS="$GPU_NS" CHANNEL="$channel" CREATE_OPERATORGROUP="$create_operatorgroup" yq '
+      select(.kind != "OperatorGroup" or strenv(CREATE_OPERATORGROUP) == "true") |
+      (select(.kind == "Namespace").metadata.name) = strenv(GPU_NS) |
+      (select(.kind != "Namespace").metadata.namespace) = strenv(GPU_NS) |
+      (select(.kind == "OperatorGroup").spec.targetNamespaces) = [strenv(GPU_NS)] |
+      (select(.kind == "Subscription").spec.channel) = strenv(CHANNEL)
+    ' "$MANIFEST_DIR/gpu-operator.yaml" | oc_apply
+  fi
   if [ "$DRY_RUN" = true ]; then
     oc_apply < "$MANIFEST_DIR/cluster-policy.yaml"
     return
   fi
-  wait_for "$CSV_TIMEOUT" "GPU Operator CSV Succeeded" csv_succeeded "$GPU_NS" gpu-operator-certified
+  wait_for_csv "$GPU_NS" "$GPU_SUBSCRIPTION"
 
   local policies
   policies=$(oc get clusterpolicy -o jsonpath='{.items[*].metadata.name}')
@@ -383,7 +441,7 @@ install_gpu_operator() {
   else
     # Prefer the operator's own default CR (alm-examples) so version-specific fields are right.
     local csv cp="$WORKDIR/clusterpolicy.json"
-    csv=$(oc get subscription gpu-operator-certified -n "$GPU_NS" -o jsonpath='{.status.installedCSV}')
+    csv=$(oc get subscription "$GPU_SUBSCRIPTION" -n "$GPU_NS" -o jsonpath='{.status.installedCSV}')
     oc get csv "$csv" -n "$GPU_NS" -o jsonpath='{.metadata.annotations.alm-examples}' \
       | yq -p json -o json '.[] | select(.kind == "ClusterPolicy")' > "$cp" 2>/dev/null || true
     if [ -s "$cp" ]; then

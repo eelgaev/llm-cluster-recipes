@@ -83,8 +83,24 @@ elif tool == "oc":
             if (os.environ.get("TEST_EXISTING_NFD") == "true" or
                 (os.environ.get("TEST_NFD_DURING_INSTALL") == "true" and "Subscription/nfd" in state)):
                 print("nodefeaturediscovery.nfd.openshift.io/nfd")
+        elif args[:2] == ["get", "subscriptions"]:
+            names = (["gpu-subscription"] if os.environ.get("TEST_EXISTING_GPU") == "true" else [])
+            if os.environ.get("TEST_DUPLICATE_GPU") == "true":
+                names = ["gpu-subscription", "gpu-operator-certified"]
+            print(json.dumps({"items":[{"metadata":{"name":name,"namespace":"nvidia-gpu-operator"},
+                "spec":{"name":"gpu-operator-certified"}} for name in names]}))
+        elif args[:2] == ["get", "operatorgroups"]:
+            names = (["existing-gpu-operator-group"] if os.environ.get("TEST_EXISTING_GPU") == "true"
+                     or os.environ.get("TEST_EXISTING_GPU_OG") == "true" else [])
+            if os.environ.get("TEST_DUPLICATE_GPU_OG") == "true":
+                names = ["existing-gpu-operator-group", "nvidia-gpu-operator-group"]
+            print(json.dumps({"items":[{"metadata":{"name":name,"namespace":"nvidia-gpu-operator"}}
+                for name in names]}))
         elif args[:2] == ["get", "subscription"]:
-            if args[-1] == "name":
+            if os.environ.get("TEST_CSV_STUCK") == "true" and args[2] == "gpu-operator-certified":
+                if "currentCSV" in args[-1]:
+                    print("UpgradePending currentCSV=gpu-operator-certified.v1 installedCSV= installPlan=ip-test conditions=InstallPlanPending=True:Installing")
+            elif args[-1] == "name":
                 if os.environ.get("TEST_NFD_ERROR") == "subscription":
                     raise SystemExit("API unavailable")
                 if "Subscription/nfd" in state:
@@ -97,6 +113,8 @@ elif tool == "oc":
             if "alm-examples" in args[-1]:
                 print(json.dumps([{"apiVersion":"nvidia.com/v1", "kind":"ClusterPolicy",
                                    "metadata":{"name":"operator-example"}, "spec":{}}]))
+            elif os.environ.get("TEST_CSV_FAILED") == "true" and args[2].startswith("gpu-operator-certified"):
+                print("Failed")
             else:
                 print("Succeeded")
         elif args[:2] == ["get", "clusterpolicy"]:
@@ -137,6 +155,12 @@ elif tool == "oc":
         elif args[0] == "get" and args[1] in ("ds", "deployment"):
             if os.environ.get("TEST_STALE_ARM") == "true":
                 print("llm-recipe-arm" if args[1] == "ds" else "llm-recipe-reconciler-arm")
+        elif args[:2] == ["get", "subscription,csv,installplan,pods"]:
+            print("Subscription/gpu-operator-certified UpgradePending")
+        elif args[:2] == ["describe", "subscription"]:
+            print("Conditions: InstallPlanPending")
+        elif args[:2] == ["describe", "csv"]:
+            print("TooManyOperatorGroups")
         elif args[0] == "get" and args[1] in ("pods", "events", "deployments,daemonsets,pods"):
             print("gpu-2 Pending / registration not ready")
         elif args[0] == "logs":
@@ -361,6 +385,50 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("ready", pod["containers"][0]["readinessProbe"]["exec"]["command"])
         self.assertIn("chcon", pod["initContainers"][0]["command"][-1])
         self.assertFalse(pod["automountServiceAccountToken"])
+
+    def test_csv_wait_reports_olm_progress_and_timeout_diagnostics(self):
+        self.live_environment()
+        self.env.update(TEST_EXISTING_NFD="true", TEST_CSV_STUCK="true", CSV_TIMEOUT="2")
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gpu-operator-certified OLM status: UpgradePending", result.stdout)
+        self.assertIn("Subscription/gpu-operator-certified UpgradePending", result.stderr)
+        self.assertIn("Conditions: InstallPlanPending", result.stderr)
+        self.assertIn("timed out waiting for gpu-operator-certified CSV Succeeded", result.stderr)
+        csv_reads = [call for call in self.calls("oc") if call["command"][:2] == ["get", "subscription"]
+                     and call["command"][2] == "gpu-operator-certified"]
+        self.assertTrue(all("--request-timeout=30s" in call["args"] or
+                            "--request-timeout=15s" in call["args"] for call in csv_reads))
+
+    def test_failed_csv_exits_without_waiting_for_timeout(self):
+        self.live_environment()
+        self.env.update(TEST_EXISTING_NFD="true", TEST_CSV_FAILED="true")
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gpu-operator-certified CSV failed", result.stderr)
+        self.assertIn("TooManyOperatorGroups", result.stderr)
+
+    def test_existing_gpu_operator_subscription_and_group_are_preserved(self):
+        self.live_environment()
+        self.env.update(TEST_EXISTING_NFD="true", TEST_EXISTING_GPU="true")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Reusing existing GPU Operator subscription gpu-subscription", result.stdout)
+        self.assertFalse(any(doc["kind"] in ("Subscription", "OperatorGroup") and
+                             doc["metadata"]["namespace"] == "nvidia-gpu-operator"
+                             for doc in self.resources()))
+        calls = [call["command"] for call in self.calls("oc")]
+        self.assertTrue(any(call[:3] == ["get", "subscription", "gpu-subscription"] for call in calls))
+
+    def test_duplicate_gpu_operator_resources_fail_before_gpu_mutations(self):
+        self.live_environment()
+        self.env.update(TEST_EXISTING_NFD="true", TEST_DUPLICATE_GPU="true")
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("multiple GPU Operator subscriptions", result.stderr)
+        self.assertFalse(any(doc["kind"] in ("Subscription", "OperatorGroup") and
+                             doc["metadata"]["namespace"] == "nvidia-gpu-operator"
+                             for doc in self.resources()))
 
     def test_rerun_preserves_nfd_policy_and_stops_obsolete_controller(self):
         self.live_environment()

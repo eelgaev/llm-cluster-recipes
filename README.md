@@ -68,8 +68,10 @@ at initial deployment.
 1. Loads local manifests or clones this repository at `REPO_REF`, then fetches
    `<url>/recipe.yaml` and validates it.
 2. Installs NFD if missing, preserving an existing DPF-managed NFD configuration. Adds a rule for
-   the vendor-only NVIDIA GPU label without changing DPF's compound PCI labels, installs the
-   NVIDIA GPU Operator via OLM, and creates or reuses its `ClusterPolicy`. GPU operands
+   the vendor-only NVIDIA GPU label without changing DPF's compound PCI labels. It reuses an
+   existing NVIDIA GPU Operator Subscription and OperatorGroup in `nvidia-gpu-operator`, or installs
+   them via OLM when absent, then creates or reuses its `ClusterPolicy`. Multiple Subscriptions or
+   OperatorGroups for that installation are reported as an error. GPU operands
    are configured to tolerate not-ready nodes and use the external API endpoint, host networking,
    and the host DNS resolver so their init containers can run before cluster pod networking.
 3. Finds GPU nodes (NFD label `feature.node.kubernetes.io/pci-10de.present=true`) and groups them by
@@ -107,7 +109,7 @@ Environment knobs:
 | Var | Meaning |
 |---|---|
 | `NS` | target namespace (default `llm-recipes`) |
-| `CSV_TIMEOUT` | seconds to wait for an operator CSV to install |
+| `CSV_TIMEOUT` | seconds to wait for an operator CSV to install (default `600`); the runner reports OLM progress and fails immediately if the CSV enters `Failed` |
 | `DEPLOY_TIMEOUT` | seconds to wait for all model servers to become healthy and registered (default `7200`); also sets the startup-probe budget |
 | `WAIT_FOR_READY` | defaults to `true`; `false` or `--no-wait` submits without waiting for model readiness |
 | `RECONCILE_RESYNC` | safety resync period in seconds (default `300`); node changes reconcile immediately via an API watch |
