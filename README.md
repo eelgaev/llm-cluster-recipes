@@ -1,8 +1,7 @@
 # llm-cluster-recipes
 
 A small runner plus readable Kubernetes manifests that install the NVIDIA GPU Operator on an
-OpenShift cluster and run an LLM "recipe" on **every GPU worker**, each pod getting **all GPUs on
-its node**.
+OpenShift cluster and run an LLM "recipe" as **one model-serving pod on every GPU worker**.
 
 ```
 ./run-recipe.sh https://host/recipes/qwen3.8-27B/ --register-url https://router.example.com/register
@@ -14,8 +13,9 @@ Remove the workload later with:
 ./run-recipe.sh uninstall
 ```
 
-The runner can also be streamed directly; it clones this repository into a temporary directory so
-the adjacent manifests are available:
+From a checkout, the runner uses its adjacent manifests, including when invoked through a
+symlink from another project. A standalone downloaded or streamed runner clones this repository
+into a temporary directory to obtain the manifests:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eelgaev/llm-cluster-recipes/main/run-recipe.sh \
@@ -23,39 +23,80 @@ curl -fsSL https://raw.githubusercontent.com/eelgaev/llm-cluster-recipes/main/ru
       --register-url https://router.example.com/register
 ```
 
-Design details live in [PLAN.md](PLAN.md).
+## Using with openshift-dpf
+
+The `openshift-dpf` custom post-install hook accepts a script path followed by arguments. With
+an executable copy of `run-recipe.sh` (or a symlink to this checkout) in the `openshift-dpf` root,
+use this value when generating its `.env`:
+
+```dotenv
+CUSTOM_POSTINSTALL_SCRIPT="./run-recipe.sh https://bfb.okoyl.xyz/llms/qwen3.8-27B --register-url https://rhllm.okoyl.xyz/register"
+```
+
+The hook also supports downloading the runner directly:
+
+```dotenv
+CUSTOM_POSTINSTALL_SCRIPT="https://raw.githubusercontent.com/eelgaev/llm-cluster-recipes/main/run-recipe.sh https://bfb.okoyl.xyz/llms/qwen3.8-27B --register-url https://rhllm.okoyl.xyz/register"
+```
+
+The runner inherits the hook's management-cluster `KUBECONFIG` and preserves the caller's working
+directory, including for relative kubeconfig paths. `make run-custom-postinstall-script` runs the
+hook independently; `make all` includes it. The automation host needs the prerequisites below.
+An explicit `REPO_URL` or `REPO_REF` selects cloned manifests even when a local checkout exists.
+When pinning a release, select the same ref in the runner URL and `REPO_REF`.
+
+By default, successful exit means the current recipe is healthy and registered on every detected
+GPU node. The runner waits through GPU initialization, downloads, model loading, and registration,
+and returns nonzero with diagnostics if `DEPLOY_TIMEOUT` expires. Pods that belong to an older
+recipe rollout do not count as success. Append `--no-wait` only when the caller wants submission
+without readiness verification. Re-run the hook when adding a CPU architecture that was absent
+at initial deployment.
 
 ## Prerequisites
 
 - `oc` logged in as cluster-admin (`oc whoami` must succeed)
 - `curl`
-- `git`
+- `git` (for standalone runners or explicit remote manifest settings)
 - [`yq`](https://github.com/mikefarah/yq) v4 (mikefarah)
-- An existing NFD deployment managed by `openshift-dpf`, including
-  `NodeFeatureDiscovery/nfd` in `openshift-nfd`
-- OperatorHub reachable from the cluster (`certified-operators` for the GPU Operator)
+- An OpenShift cluster with NVIDIA GPU workers and enough memory for the selected recipe
+- OperatorHub reachable from the cluster (`redhat-operators` for NFD and
+  `certified-operators` for the GPU Operator)
+- GPU nodes can reach the recipe files, runtime image registry, and HTTPS registration endpoint
 
 ## What `run-recipe.sh` does
 
-1. Clones this repository at `REPO_REF`, then fetches `<url>/recipe.yaml` and validates it.
-2. Adds an NFD rule for the vendor-only NVIDIA GPU label without changing DPF's compound PCI
-   labels, installs the NVIDIA GPU Operator via OLM, and creates the `ClusterPolicy`. GPU operands
+1. Loads local manifests or clones this repository at `REPO_REF`, then fetches
+   `<url>/recipe.yaml` and validates it.
+2. Installs NFD if missing, preserving an existing DPF-managed NFD configuration. Adds a rule for
+   the vendor-only NVIDIA GPU label without changing DPF's compound PCI labels, installs the
+   NVIDIA GPU Operator via OLM, and creates or reuses its `ClusterPolicy`. GPU operands
    are configured to tolerate not-ready nodes and use the external API endpoint, host networking,
    and the host DNS resolver so their init containers can run before cluster pod networking.
 3. Finds GPU nodes (NFD label `feature.node.kubernetes.io/pci-10de.present=true`) and groups them by
    CPU architecture.
-4. For each architecture, creates an in-cluster reconciler and returns immediately. The reconciler
-   waits until every matching node advertises `nvidia.com/gpu` capacity, then creates or updates
+4. For each architecture, creates an in-cluster reconciler. The reconciler
+   creates or updates the workload once at least one matching node advertises `nvidia.com/gpu`
+   capacity, allowing other nodes to finish initializing independently. It manages
    DaemonSet `llm-recipe-<arch>` (using `image_for`, `<type>-<arch>`) in namespace
    `llm-recipes`. The DaemonSet:
    - runs with `hostNetwork: true` (server on `https://<node-ip>:52395`),
-   - uses a dedicated service account and a narrowly scoped SCC permitting host networking, the
+   - uses a dedicated service account and an SCC permitting host networking, the
      server port, and the node-local model cache,
-   - requests every GPU on the node (`nvidia.com/gpu: N`),
+   - requests the smallest positive GPU capacity currently reported within that architecture
+     (`nvidia.com/gpu: N`), so nodes with different GPU counts share one DaemonSet,
    - mounts the recipe script from a ConfigMap at `/recipe/script.sh`,
+   - mounts the runner's entrypoint and health checks at `/runtime`, so deployment fixes take
+     effect without rebuilding the inference image,
    - mounts a persistent node-local model cache at `/models`, with `emptyDir`s at `/certs` and a
      memory-backed `/dev/shm`.
-5. Prints node IPs and commands for following both the reconciler and workload. Kubernetes keeps
+   A root init container uses SELinux `spc_t` only to prepare and relabel the mounted cache; the
+   model server uses `container_t`, drops all capabilities, and has no service-account token.
+5. Waits for the current DaemonSets to cover every detected GPU node with healthy, registered
+   pods. Registration must return HTTP 2xx; redirects and failures are retried with bounded
+   request timeouts. A startup probe allows model loading, readiness includes registration, and
+   a liveness probe restarts an unresponsive server. On timeout the runner prints workload and
+   GPU Operator state, events, and recent workload logs, then exits with an error.
+6. Prints node IPs and commands for following both the reconciler and workload. Kubernetes keeps
    reconciling the controller objects after `run-recipe.sh` exits; recipe or server failures exit
    the workload container and remain visible in pod status.
 
@@ -67,11 +108,15 @@ Environment knobs:
 |---|---|
 | `NS` | target namespace (default `llm-recipes`) |
 | `CSV_TIMEOUT` | seconds to wait for an operator CSV to install |
+| `DEPLOY_TIMEOUT` | seconds to wait for all model servers to become healthy and registered (default `7200`); also sets the startup-probe budget |
+| `WAIT_FOR_READY` | defaults to `true`; `false` or `--no-wait` submits without waiting for model readiness |
 | `RECONCILE_RESYNC` | safety resync period in seconds (default `300`); node changes reconcile immediately via an API watch |
-| `DRY_RUN=true` | render everything with `oc apply --dry-run=client` and skip the waits |
+| `DRY_RUN=true` | render YAML to stdout without applying resources or waiting; does not require installed operator CRDs; uninstall only prints planned deletions |
 | `REPO_URL` | manifest repository to clone (default: this GitHub repository over HTTPS) |
 | `REPO_REF` | branch or tag to clone (default `main`) |
 | `MODEL_CACHE_ROOT` | host directory for per-recipe model caches (default `/var/cache/llm-cluster-recipes/models`) |
+| `LLAMA_CPP_X86_IMAGE` | override the x86 llama.cpp runtime image |
+| `LLAMA_CPP_ARM_IMAGE` | override the ARM llama.cpp runtime image |
 
 ## Manifests
 
@@ -86,6 +131,8 @@ Required flag:
 - `--register-url <https-url>` — each pod POSTs
   `{"host":"<node-ip>","port":52395,"api_key":"<key>"}` here once its server is healthy. The
   connection uses normal CA and hostname verification and retries until registration succeeds.
+
+Optional flag: `--no-wait` returns after submitting controllers; it does not certify readiness.
 
 ## Recipe schema
 
@@ -144,10 +191,12 @@ of the recipe — the same recipe can be deployed against different routers.
 ## Uninstalling
 
 `./run-recipe.sh uninstall` deletes the workload namespace selected by `NS`, its custom SCC, and
-its cluster-wide Node-reader RBAC. It intentionally preserves the shared NFD and NVIDIA GPU
-Operator installation. It also preserves model data under `MODEL_CACHE_ROOT` on every node, so a
+its cluster-wide Node-reader and SCC-access RBAC. It intentionally preserves the shared NFD and
+NVIDIA GPU Operator installation. It also preserves model data under `MODEL_CACHE_ROOT` on every node, so a
 later deployment can reuse it. Remove those host directories separately when the cached weights
 are no longer needed.
+
+Preview uninstall without deleting resources with `DRY_RUN=true ./run-recipe.sh uninstall`.
 
 ## Images
 
@@ -156,18 +205,21 @@ Recipes do not name images. `run-recipe.sh` holds a lookup at the top:
 ```bash
 image_for() {
   case "$1" in
-    llama-cpp-arm) echo "quay.io/PLACEHOLDER/llama-cpp:arm" ;;
-    llama-cpp-x86) echo "quay.io/PLACEHOLDER/llama-cpp:x86" ;;
-    vllm-x86)      echo "quay.io/PLACEHOLDER/vllm:x86" ;;
+    llama-cpp-arm) echo "${LLAMA_CPP_ARM_IMAGE:-quay.io/eelgaev/llama-cpp-arm:latest}" ;;
+    llama-cpp-x86) echo "${LLAMA_CPP_X86_IMAGE:-quay.io/eelgaev/llama-cpp-x86:latest}" ;;
     *) return 1 ;;
   esac
 }
 ```
 
 Add a `<type>-<arch>` entry (and list it in `KNOWN_IMAGES`) for every combination you want to
-support. The script errors clearly
-when a GPU node's arch has no image for the recipe's `type`. `container/llama-cpp.Containerfile` is a stub for
-building those images (`entrypoint.sh` is the only real content so far).
+support. Unsupported runtime types are rejected before cluster resources are changed.
+`container/llama-cpp.Containerfile` builds a CUDA-enabled llama-server with TLS and the runtime tools
+needed by the recipe. The runner pulls a prebuilt image; it does not compile llama.cpp during
+deployment. Custom images must provide Bash, curl, OpenSSL, wget, coreutils, and the recipe runtime.
+
+The current deployment target is x86. Before enabling ARM GPU workers, publish an accessible ARM
+image or set `LLAMA_CPP_ARM_IMAGE`; private images also require appropriate cluster pull credentials.
 
 ## Staging weights (maintainer)
 
@@ -190,4 +242,15 @@ oc logs -f -l app=llm-recipe -n llm-recipes --max-log-requests=20
 curl -k https://<node-ip>:52395/health -H "Authorization: Bearer <api-key>"
 ```
 
-The API key is per pod — read it from the pod's registration POST or `oc exec ... -- printenv API_KEY`.
+The API key is per pod and is sent to the registration endpoint. Administrators can also read it
+with `oc exec -n llm-recipes <pod> -- cat /certs/api-key`. It is stored with mode `0600`, and the
+entrypoint invalidates the old registration marker whenever the container restarts.
+
+## Local checks
+
+Run `python3 -m unittest discover -s tests -v` with Bash and mikefarah `yq` v4 installed.
+The regression tests mock `oc`, `curl`, `git`, and `wget`; they do not contact a cluster,
+download weights, or register servers. They cover DPF-style invocation, rendering and RBAC,
+dry-run uninstall, fresh NFD/GPU Operator bootstrap, preservation of shared configuration, current
+rollout readiness on all GPU nodes, timeout diagnostics, registration failures, probe authentication,
+reconciliation with initializing nodes, watch failures, and interrupted downloads.

@@ -1,0 +1,12 @@
+apiVersion: nfd.openshift.io/v1
+kind: NodeFeatureDiscovery
+metadata:
+  name: nfd
+  namespace: openshift-nfd
+spec:
+  workerConfig:
+    configData: |
+      sources:
+        pci:
+          deviceClassWhitelist: ["02", "03", "12"]
+          deviceLabelFields: ["vendor", "device", "class"]

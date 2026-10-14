@@ -26,6 +26,11 @@ spec:
       serviceAccountName: llm-recipe
       hostNetwork: true
       dnsPolicy: Default
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 0
+        seccompProfile:
+          type: RuntimeDefault
       nodeSelector:
         feature.node.kubernetes.io/pci-10de.present: "true"
         kubernetes.io/arch: arch-placeholder
@@ -33,11 +38,38 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      initContainers:
+        - name: prepare-cache
+          image: image-placeholder
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              chmod 0755 /models
+              # hostPath volumes are not automatically relabeled by kubelet.
+              if [ -e /sys/fs/selinux/enforce ]; then
+                chcon -R -t container_file_t -l s0 /models
+              fi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seLinuxOptions:
+              type: spc_t
+          volumeMounts:
+            - name: models
+              mountPath: /models
       containers:
         - name: llm
           image: image-placeholder
           imagePullPolicy: Always
-          command: ["/usr/local/bin/entrypoint.sh"]
+          command: ["/bin/bash", "/runtime/entrypoint.sh"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seLinuxOptions:
+              type: container_t
           env:
             - name: RECIPE_BASE_URL
               value: https://recipe.invalid
@@ -62,24 +94,33 @@ spec:
             exec:
               command:
                 - /bin/bash
-                - -c
-                - 'curl -ksf -H "Authorization: Bearer ${API_KEY}" "https://127.0.0.1:${PORT}/health" >/dev/null'
+                - /runtime/healthcheck.sh
+                - live
             periodSeconds: 5
             timeoutSeconds: 3
-            failureThreshold: 360
+            failureThreshold: 1440
           readinessProbe:
             exec:
               command:
                 - /bin/bash
-                - -c
-                - 'curl -ksf -H "Authorization: Bearer ${API_KEY}" "https://127.0.0.1:${PORT}/health" >/dev/null'
+                - /runtime/healthcheck.sh
+                - ready
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/bin/bash", "/runtime/healthcheck.sh", "live"]
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 6
           resources:
             limits:
               nvidia.com/gpu: "__GPU_COUNT__"
           volumeMounts:
+            - name: runtime
+              mountPath: /runtime
+              readOnly: true
             - name: recipe
               mountPath: /recipe
             - name: models
@@ -89,6 +130,9 @@ spec:
             - name: shm
               mountPath: /dev/shm
       volumes:
+        - name: runtime
+          configMap:
+            name: llm-recipe-runtime
         - name: recipe
           configMap:
             name: llm-recipe-script

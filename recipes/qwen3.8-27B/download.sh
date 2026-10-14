@@ -23,6 +23,7 @@ echo "$FILES" | while read -r name url; do
     continue
   fi
   echo "fetching $name"
-  wget -c --header="Authorization: Bearer $HF_TOKEN" "$url" -O "$name"
+  wget -c --header="Authorization: Bearer $HF_TOKEN" "$url" -O "${name}.part"
+  mv "${name}.part" "$name"
 done
 echo "done — serve this folder over HTTP and pass its URL to run-recipe.sh"

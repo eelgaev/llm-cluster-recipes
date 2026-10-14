@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-recipe-runtime
+  namespace: llm-recipes
+data:
+  entrypoint.sh: |
+    # Loaded from container/entrypoint.sh by run-recipe.sh.
+  healthcheck.sh: |
+    # Loaded from container/healthcheck.sh by run-recipe.sh.

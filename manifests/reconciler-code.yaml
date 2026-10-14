@@ -9,21 +9,53 @@ data:
     set -uo pipefail
 
     selector="feature.node.kubernetes.io/pci-10de.present=true,kubernetes.io/arch=${K8S_ARCH}"
+    workdir=$(mktemp -d) || exit 1
+    watch_pid=""
+    cleanup() {
+      if [ -n "$watch_pid" ]; then
+        kill "$watch_pid" 2>/dev/null || true
+        wait "$watch_pid" 2>/dev/null || true
+      fi
+      rm -rf "$workdir"
+    }
+    trap cleanup EXIT
+    trap 'exit 0' TERM INT
+    mkfifo "$workdir/node-events" || exit 1
+
+    wait_for_node_change() {
+      oc --request-timeout="${RECONCILE_RESYNC}s" get nodes -l "$selector" \
+        --watch-only -o name > "$workdir/node-events" &
+      watch_pid=$!
+      # Close the watch after the first event. A pipeline ending in head would
+      # wait for oc to write another event before noticing the closed pipe.
+      if IFS= read -r _ < "$workdir/node-events"; then
+        kill "$watch_pid" 2>/dev/null || true
+        wait "$watch_pid" 2>/dev/null || true
+      else
+        wait "$watch_pid" 2>/dev/null || true
+        echo "Node watch ended without an event; retrying in 5s" >&2
+        sleep 5
+      fi
+      watch_pid=""
+    }
+
     previous=""
     while :; do
-      capacities=$(oc get nodes -l "$selector" \
-        -o go-template='{{range .items}}{{index .status.capacity "nvidia.com/gpu"}}{{"\n"}}{{end}}' \
-        2>/dev/null || true)
+      if ! capacities=$(oc get nodes -l "$selector" \
+        -o go-template='{{range .items}}{{index .status.capacity "nvidia.com/gpu"}}{{"\n"}}{{end}}'); then
+        echo "Could not list GPU nodes; retrying in 5s" >&2
+        sleep 5
+        continue
+      fi
       summary=$(awk '
-        BEGIN { ok=1; count=0; min=0; distinct="" }
+        BEGIN { count=0; min=0; distinct="" }
         /^[1-9][0-9]*$/ {
           value=$1+0; count++
           if (min == 0 || value < min) min=value
           if (!(value in seen)) { seen[value]=1; distinct=distinct " " value }
           next
         }
-        { ok=0 }
-        END { if (ok && count > 0) print min ":" count ":" distinct }
+        END { if (count > 0) print min ":" count ":" distinct }
       ' <<<"$capacities")
 
       if [[ "$summary" =~ ^([1-9][0-9]*):([1-9][0-9]*):(.*)$ ]]; then
@@ -34,16 +66,18 @@ data:
           echo "GPU capacity available on $nodes $K8S_ARCH node(s); using $gpus GPU(s) per pod (reported:$counts)"
           previous=$summary
         fi
-        sed "s/__GPU_COUNT__/$gpus/g" /template/daemonset.yaml > /tmp/daemonset.yaml
-        oc apply -n "$TARGET_NAMESPACE" -f /tmp/daemonset.yaml >/dev/null \
-          || echo "Could not reconcile $DS_NAME; retrying" >&2
+        if ! sed "s/__GPU_COUNT__/$gpus/g" /template/daemonset.yaml > "$workdir/daemonset.yaml" \
+          || ! oc apply -n "$TARGET_NAMESPACE" -f "$workdir/daemonset.yaml" >/dev/null; then
+          echo "Could not reconcile $DS_NAME; retrying in 5s" >&2
+          sleep 5
+          continue
+        fi
       elif [ "$previous" != waiting ]; then
-        echo "Waiting for every matching $K8S_ARCH GPU node to advertise nvidia.com/gpu capacity"
+        echo "Waiting for a matching $K8S_ARCH GPU node to advertise nvidia.com/gpu capacity"
         previous=waiting
       fi
       # React immediately to node status/label changes. The request timeout is
       # only a slow safety resync in case the DaemonSet is changed or deleted
       # without a corresponding node event.
-      oc --request-timeout="${RECONCILE_RESYNC}s" get nodes -l "$selector" \
-        --watch-only -o name 2>/dev/null | head -n 1 >/dev/null || true
+      wait_for_node_change
     done

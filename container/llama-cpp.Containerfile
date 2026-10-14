@@ -29,6 +29,9 @@ FROM nvcr.io/nvidia/cuda:${CUDA_VERSION}-runtime-ubi9
 
 RUN dnf install -y \
         bash \
+        curl-minimal \
+        ca-certificates \
+        coreutils \
         wget \
         openssl \
         hostname \
@@ -40,6 +43,7 @@ COPY --from=builder /root/llama.cpp/build/bin/ /usr/local/bin/
 WORKDIR /recipe
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY healthcheck.sh /usr/local/bin/healthcheck.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

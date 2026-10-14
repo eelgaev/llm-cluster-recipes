@@ -19,6 +19,7 @@ spec:
         arch: arch-placeholder
       annotations:
         llm-recipes.openai.com/template-checksum: checksum-placeholder
+        llm-recipes.openai.com/code-checksum: checksum-placeholder
     spec:
       serviceAccountName: llm-recipe-reconciler
       containers:
