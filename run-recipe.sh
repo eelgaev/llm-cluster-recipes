@@ -439,23 +439,10 @@ install_gpu_operator() {
   GPU_POLICY=${policies:-gpu-cluster-policy}
   if [ -n "$policies" ]; then
     log "Using existing ClusterPolicy $GPU_POLICY"
-    # A working, pre-existing GPU Operator needs no changes to its policy or
-    # operand DaemonSets. In particular, do not roll healthy NVIDIA pods just
-    # to install an LLM workload on already-ready GPU nodes.
-    local capacities
-    capacities=$(oc --request-timeout=30s get nodes -l "$GPU_LABEL" \
-      -o go-template='{{range .items}}{{index .status.capacity "nvidia.com/gpu"}}{{"\n"}}{{end}}') \
-      || die "could not inspect existing GPU capacity"
-    if [ -n "$capacities" ] && awk '
-      BEGIN { count=0; valid=1 }
-      /^[1-9][0-9]*$/ { count++; next }
-      { valid=0 }
-      END { exit !(valid && count > 0) }
-    ' <<<"$capacities"; then
-      CONFIGURE_GPU_OPERANDS=false
-      log "GPU capacity is already available on every labeled node; preserving existing GPU Operator configuration"
-      return
-    fi
+    # Reusing a ClusterPolicy must not reconfigure shared GPU Operator operands.
+    CONFIGURE_GPU_OPERANDS=false
+    log "Preserving existing GPU Operator configuration"
+    return
   else
     # Prefer the operator's own default CR (alm-examples) so version-specific fields are right.
     local csv cp="$WORKDIR/clusterpolicy.json"

@@ -143,10 +143,7 @@ elif tool == "oc":
             }}}})
             print(json.dumps(operand))
         elif args[:2] == ["get", "nodes"]:
-            if any(arg.startswith("go-template=") for arg in args):
-                if os.environ.get("TEST_GPU_CAPACITY_READY") == "true":
-                    print("2\n2")
-            elif "json" in args:
+            if "json" in args:
                 print(json.dumps({"items":[{"metadata":{"name":"gpu-"+str(i)},
                     "status":{"nodeInfo":{"architecture":"amd64"}, "capacity":{"nvidia.com/gpu":"1"}}} for i in (1,2)]}))
             elif "name" in args:
@@ -442,13 +439,13 @@ class RunnerTests(unittest.TestCase):
         calls = [call["command"] for call in self.calls("oc")]
         self.assertTrue(any(call[:3] == ["get", "subscription", "gpu-subscription"] for call in calls))
 
-    def test_healthy_existing_gpu_operator_is_not_reconfigured(self):
+    def test_existing_gpu_operator_is_not_reconfigured(self):
         self.live_environment()
         self.env.update(TEST_EXISTING_NFD="true", TEST_EXISTING_GPU="true",
-                        TEST_POLICY_NAME="gpu-cluster-policy", TEST_GPU_CAPACITY_READY="true")
+                        TEST_POLICY_NAME="gpu-cluster-policy")
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("preserving existing GPU Operator configuration", result.stdout)
+        self.assertIn("Preserving existing GPU Operator configuration", result.stdout)
         self.assertFalse(any(call["command"][:2] == ["patch", "clusterpolicy"] or
                              (call["command"] and call["command"][0] == "patch" and
                               call["command"][1].startswith("daemonset"))
@@ -472,10 +469,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(any(d["kind"] in ("NodeFeatureDiscovery", "ClusterPolicy") for d in self.resources()))
         calls = [c["command"] for c in self.calls("oc")]
-        patch = next(c for c in calls if c[:2] == ["patch", "clusterpolicy"])
-        self.assertEqual(patch[2], "custom-policy")
-        envs = json.loads(patch[patch.index("-p") + 1])["spec"]["driver"]["manager"]["env"]
-        self.assertIn({"name":"KUBERNETES_SERVICE_HOST", "value":"2001:db8::1"}, envs)
+        self.assertFalse(any(c[:2] == ["patch", "clusterpolicy"] or
+                             (c[0] == "patch" and c[1].startswith("daemonset")) for c in calls))
         deletes = [c for c in calls if c[0] == "delete"]
         self.assertEqual([c[1] for c in deletes], ["deployment", "configmap", "ds"])
         self.assertIn("--cascade=foreground", deletes[0])

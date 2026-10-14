@@ -71,9 +71,9 @@ at initial deployment.
    the vendor-only NVIDIA GPU label without changing DPF's compound PCI labels. It reuses an
    existing NVIDIA GPU Operator Subscription and OperatorGroup in `nvidia-gpu-operator`, or installs
    them via OLM when absent, then creates or reuses its `ClusterPolicy`. Multiple Subscriptions or
-   OperatorGroups for that installation are reported as an error. When every labeled GPU node
-   already advertises GPU capacity, the existing GPU Operator configuration is preserved. On
-   initializing installations, GPU operands are configured to tolerate not-ready nodes and use
+   OperatorGroups for that installation are reported as an error. An existing ClusterPolicy and
+   its GPU Operator operands are preserved. For a new ClusterPolicy, GPU operands are configured
+   to tolerate not-ready nodes and use
    the external API endpoint, host networking, and the host DNS resolver so their init containers
    can run before cluster pod networking.
 3. Finds GPU nodes (NFD label `feature.node.kubernetes.io/pci-10de.present=true`) and groups them by
