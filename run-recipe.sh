@@ -44,6 +44,7 @@ DEPLOY_TIMEOUT="${DEPLOY_TIMEOUT:-7200}"   # includes GPU initialization, model 
 WAIT_FOR_READY="${WAIT_FOR_READY:-true}"
 RECONCILE_RESYNC="${RECONCILE_RESYNC:-300}"
 DRY_RUN="${DRY_RUN:-false}"                 # true -> skip cluster mutations, render only
+CONFIGURE_GPU_OPERANDS=true
 # Explicit repository settings request remote manifests even from a checkout.
 REMOTE_MANIFESTS=false
 if [ -n "${REPO_URL:-}" ] || [ -n "${REPO_REF:-}" ]; then REMOTE_MANIFESTS=true; fi
@@ -438,6 +439,23 @@ install_gpu_operator() {
   GPU_POLICY=${policies:-gpu-cluster-policy}
   if [ -n "$policies" ]; then
     log "Using existing ClusterPolicy $GPU_POLICY"
+    # A working, pre-existing GPU Operator needs no changes to its policy or
+    # operand DaemonSets. In particular, do not roll healthy NVIDIA pods just
+    # to install an LLM workload on already-ready GPU nodes.
+    local capacities
+    capacities=$(oc --request-timeout=30s get nodes -l "$GPU_LABEL" \
+      -o go-template='{{range .items}}{{index .status.capacity "nvidia.com/gpu"}}{{"\n"}}{{end}}') \
+      || die "could not inspect existing GPU capacity"
+    if [ -n "$capacities" ] && awk '
+      BEGIN { count=0; valid=1 }
+      /^[1-9][0-9]*$/ { count++; next }
+      { valid=0 }
+      END { exit !(valid && count > 0) }
+    ' <<<"$capacities"; then
+      CONFIGURE_GPU_OPERANDS=false
+      log "GPU capacity is already available on every labeled node; preserving existing GPU Operator configuration"
+      return
+    fi
   else
     # Prefer the operator's own default CR (alm-examples) so version-specific fields are right.
     local csv cp="$WORKDIR/clusterpolicy.json"
@@ -513,6 +531,7 @@ install_gpu_operator() {
 }
 
 configure_gpu_operand_networking() {
+  [ "$CONFIGURE_GPU_OPERANDS" = true ] || return 0
   local operands operand_ds operand_json operand_patch
   operands=$(oc --request-timeout=30s get daemonsets -n "$GPU_NS" -o name) || return 1
   for operand_ds in $operands; do

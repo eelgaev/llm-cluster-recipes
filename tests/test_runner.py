@@ -143,7 +143,10 @@ elif tool == "oc":
             }}}})
             print(json.dumps(operand))
         elif args[:2] == ["get", "nodes"]:
-            if "json" in args:
+            if any(arg.startswith("go-template=") for arg in args):
+                if os.environ.get("TEST_GPU_CAPACITY_READY") == "true":
+                    print("2\n2")
+            elif "json" in args:
                 print(json.dumps({"items":[{"metadata":{"name":"gpu-"+str(i)},
                     "status":{"nodeInfo":{"architecture":"amd64"}, "capacity":{"nvidia.com/gpu":"1"}}} for i in (1,2)]}))
             elif "name" in args:
@@ -438,6 +441,18 @@ class RunnerTests(unittest.TestCase):
                              for doc in self.resources()))
         calls = [call["command"] for call in self.calls("oc")]
         self.assertTrue(any(call[:3] == ["get", "subscription", "gpu-subscription"] for call in calls))
+
+    def test_healthy_existing_gpu_operator_is_not_reconfigured(self):
+        self.live_environment()
+        self.env.update(TEST_EXISTING_NFD="true", TEST_EXISTING_GPU="true",
+                        TEST_POLICY_NAME="gpu-cluster-policy", TEST_GPU_CAPACITY_READY="true")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("preserving existing GPU Operator configuration", result.stdout)
+        self.assertFalse(any(call["command"][:2] == ["patch", "clusterpolicy"] or
+                             (call["command"] and call["command"][0] == "patch" and
+                              call["command"][1].startswith("daemonset"))
+                             for call in self.calls("oc")))
 
     def test_duplicate_gpu_operator_resources_fail_before_gpu_mutations(self):
         self.live_environment()
