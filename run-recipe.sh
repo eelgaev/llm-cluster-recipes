@@ -41,7 +41,7 @@ GPU_LABEL="feature.node.kubernetes.io/pci-10de.present=true"
 PORT=52395
 CSV_TIMEOUT="${CSV_TIMEOUT:-600}"          # seconds to wait for an operator CSV
 DEPLOY_TIMEOUT="${DEPLOY_TIMEOUT:-7200}"   # includes GPU initialization, model loading, registration
-WAIT_FOR_READY="${WAIT_FOR_READY:-true}"
+WAIT_FOR_READY="${WAIT_FOR_READY:-false}"
 RECONCILE_RESYNC="${RECONCILE_RESYNC:-300}"
 DRY_RUN="${DRY_RUN:-false}"                 # true -> skip cluster mutations, render only
 CONFIGURE_GPU_OPERANDS=true
@@ -147,7 +147,7 @@ wait_for_csv() {
 # 1. Args & preflight
 # ----------------------------------------------------------------------------
 usage() {
-  die "usage: $0 <http-url-to-recipe-folder> --register-url <https-url> [--no-wait]
+  die "usage: $0 <http-url-to-recipe-folder> --register-url <https-url> [--wait]
        $0 uninstall"
 }
 
@@ -176,6 +176,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --register-url)   [ $# -ge 2 ] || usage; REGISTER_URL=$2; shift 2 ;;
     --register-url=*) REGISTER_URL=${1#*=}; shift ;;
+    --wait)           WAIT_FOR_READY=true; shift ;;
     --no-wait)        WAIT_FOR_READY=false; shift ;;
     -h|--help)        usage ;;
     -*)               die "unknown option: $1" ;;
@@ -782,15 +783,15 @@ workloads_ready() {
   while read -r actual_arch; do
     case "$actual_arch" in amd64) a=x86 ;; arm64) a=arm ;; *) return 1 ;; esac
     [ -f "$WORKDIR/template-checksum-$a" ] || return 1
-  done < <(yq -p json -r '.items[].status.nodeInfo.architecture' "$node_file")
-  [ "$(yq -p json '.items | length' "$node_file")" -gt 0 ] || return 1
+  done < <(yq -p json -o json -r '.items[].status.nodeInfo.architecture' "$node_file")
+  [ "$(yq -p json -o json '.items | length' "$node_file")" -gt 0 ] || return 1
   for a in $DEPLOYED_ARCHES; do
     case "$a" in x86) k8s_arch=amd64 ;; arm) k8s_arch=arm64 ;; esac
-    expected=$(K8S_ARCH="$k8s_arch" yq -p json '[.items[] | select(.status.nodeInfo.architecture == strenv(K8S_ARCH))] | length' "$node_file")
+    expected=$(K8S_ARCH="$k8s_arch" yq -p json -o json '[.items[] | select(.status.nodeInfo.architecture == strenv(K8S_ARCH))] | length' "$node_file")
     [ "$expected" -gt 0 ] || continue
     checksum=$(cat "$WORKDIR/template-checksum-$a")
     oc --request-timeout=30s get daemonset "llm-recipe-$a" -n "$NS" -o json > "$ds_file" 2>/dev/null || return 1
-    EXPECTED="$expected" CHECKSUM="$checksum" yq -p json -e '
+    EXPECTED="$expected" CHECKSUM="$checksum" yq -p json -o json -e '
       .spec.template.metadata.annotations."llm-recipes.openai.com/template-checksum" == strenv(CHECKSUM) and
       (.status.observedGeneration // 0) >= .metadata.generation and
       .status.desiredNumberScheduled == env(EXPECTED) and
@@ -798,7 +799,7 @@ workloads_ready() {
       .status.numberReady == env(EXPECTED) and
       .status.numberAvailable == env(EXPECTED) and
       (.status.numberMisscheduled // 0) == 0
-    ' "$ds_file" >/dev/null || return 1
+    ' "$ds_file" >/dev/null 2>&1 || return 1
   done
 }
 
@@ -816,7 +817,7 @@ if [ "$WAIT_FOR_READY" = true ]; then
   done
   log "Recipe '$RECIPE_NAME' is healthy and registered on every detected GPU node"
 else
-  log "Recipe '$RECIPE_NAME' submitted; --no-wait selected, readiness and registration have not been verified"
+  log "Recipe '$RECIPE_NAME' submitted; workload readiness and registration have not been verified"
 fi
 log "Servers (hostNetwork):"
 oc get nodes -l "$GPU_LABEL" -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \

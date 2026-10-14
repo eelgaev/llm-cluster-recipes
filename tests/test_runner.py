@@ -379,7 +379,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_full_install_bootstraps_nfd_and_waits_for_current_recipe_on_all_nodes(self):
         self.live_environment()
-        result = self.run_script()
+        result = self.run_script(extra_args=("--wait",))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         docs = self.resources()
         self.assertTrue(any(d["kind"] == "NodeFeatureDiscovery" for d in docs))
@@ -389,6 +389,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(state["reads"], 3, "Must reject old templates and partial readiness")
         self.assertIn("healthy and registered on every detected GPU node", result.stdout)
         self.assertNotIn("Unexpected", result.stderr)
+        self.assertNotIn("[WARNING]", result.stderr)
+        self.assertNotIn("Error: no matches found", result.stderr)
         runtime = next(d for d in docs if d["metadata"]["name"] == "llm-recipe-runtime")
         self.assertIn("/certs/registered", runtime["data"]["healthcheck.sh"])
         template = state["ConfigMap/llm-recipe-reconciler-x86"]["data"]["daemonset.yaml"]
@@ -498,18 +500,20 @@ class RunnerTests(unittest.TestCase):
     def test_failed_deployment_returns_nonzero_with_diagnostics(self):
         self.live_environment("deploy-timeout")
         self.env["DEPLOY_TIMEOUT"] = "2"
-        result = self.run_script()
+        result = self.run_script(extra_args=("--wait",))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not healthy and registered on every GPU node", result.stderr)
         self.assertIn("registration POST failed", result.stdout)
         self.assertNotIn("healthy and registered on every detected", result.stdout)
 
-    def test_no_wait_is_explicit_and_does_not_report_readiness(self):
+    def test_default_submits_without_waiting_for_workloads(self):
         self.live_environment()
-        result = self.run_script(extra_args=("--no-wait",))
+        result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("readiness and registration have not been verified", result.stdout)
         self.assertNotIn("reads", json.loads((self.path / "cluster.json").read_text()))
+        self.assertFalse(any(c["command"][:2] == ["get", "daemonset"] for c in self.calls("oc")))
+        self.assertNotIn("[WARNING]", result.stderr)
 
     def test_unknown_runtime_fails_before_cluster_mutations(self):
         recipe = self.path / "recipe.yaml"

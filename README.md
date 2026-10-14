@@ -45,12 +45,11 @@ hook independently; `make all` includes it. The automation host needs the prereq
 An explicit `REPO_URL` or `REPO_REF` selects cloned manifests even when a local checkout exists.
 When pinning a release, select the same ref in the runner URL and `REPO_REF`.
 
-By default, successful exit means the current recipe is healthy and registered on every detected
-GPU node. The runner waits through GPU initialization, downloads, model loading, and registration,
-and returns nonzero with diagnostics if `DEPLOY_TIMEOUT` expires. Pods that belong to an older
-recipe rollout do not count as success. Append `--no-wait` only when the caller wants submission
-without readiness verification. Re-run the hook when adding a CPU architecture that was absent
-at initial deployment.
+By default, the runner returns after submitting the workload manifests; the in-cluster reconciler
+creates the DaemonSets as GPU capacity appears. It does not wait for model pods, downloads, or
+registration. Use `--wait` to verify that the current recipe is healthy and registered on every
+detected GPU node. In that mode, `DEPLOY_TIMEOUT` limits the wait and a timeout prints diagnostics.
+Re-run the hook when adding a CPU architecture that was absent at initial deployment.
 
 ## Prerequisites
 
@@ -95,11 +94,11 @@ at initial deployment.
      memory-backed `/dev/shm`.
    A root init container uses SELinux `spc_t` only to prepare and relabel the mounted cache; the
    model server uses `container_t`, drops all capabilities, and has no service-account token.
-5. Waits for the current DaemonSets to cover every detected GPU node with healthy, registered
-   pods. Registration must return HTTP 2xx; redirects and failures are retried with bounded
-   request timeouts. A startup probe allows model loading, readiness includes registration, and
-   a liveness probe restarts an unresponsive server. On timeout the runner prints workload and
-   GPU Operator state, events, and recent workload logs, then exits with an error.
+5. Submits the workload controllers and exits without waiting for model pods. Registration must
+   return HTTP 2xx; redirects and failures are retried with bounded request timeouts. A startup
+   probe allows model loading, readiness includes registration, and a liveness probe restarts an
+   unresponsive server. With `--wait`, the runner checks the current rollout on every detected
+   GPU node and prints diagnostics if it times out.
 6. Prints node IPs and commands for following both the reconciler and workload. Kubernetes keeps
    reconciling the controller objects after `run-recipe.sh` exits; recipe or server failures exit
    the workload container and remain visible in pod status.
@@ -113,7 +112,7 @@ Environment knobs:
 | `NS` | target namespace (default `llm-recipes`) |
 | `CSV_TIMEOUT` | seconds to wait for an operator CSV to install (default `600`); the runner reports OLM progress and fails immediately if the CSV enters `Failed` |
 | `DEPLOY_TIMEOUT` | seconds to wait for all model servers to become healthy and registered (default `7200`); also sets the startup-probe budget |
-| `WAIT_FOR_READY` | defaults to `true`; `false` or `--no-wait` submits without waiting for model readiness |
+| `WAIT_FOR_READY` | defaults to `false`; `true` or `--wait` checks model readiness and registration |
 | `RECONCILE_RESYNC` | safety resync period in seconds (default `300`); node changes reconcile immediately via an API watch |
 | `DRY_RUN=true` | render YAML to stdout without applying resources or waiting; does not require installed operator CRDs; uninstall only prints planned deletions |
 | `REPO_URL` | manifest repository to clone (default: this GitHub repository over HTTPS) |
@@ -136,7 +135,8 @@ Required flag:
   `{"host":"<node-ip>","port":52395,"api_key":"<key>"}` here once its server is healthy. The
   connection uses normal CA and hostname verification and retries until registration succeeds.
 
-Optional flag: `--no-wait` returns after submitting controllers; it does not certify readiness.
+Optional flag: `--wait` checks workload readiness and registration before returning. `--no-wait`
+remains available to override `WAIT_FOR_READY=true`.
 
 ## Recipe schema
 
