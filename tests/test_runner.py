@@ -66,7 +66,17 @@ elif tool == "oc":
         elif args[0] == "patch":
             patch = json.loads(args[args.index("-p") + 1])
             if args[1].startswith("daemonset"):
-                state["operand"] = patch
+                operand = state.get("operand", {"spec":{"template":{"spec":{
+                    "containers":[{"name":"device-plugin", "image":"test.invalid/device-plugin:v1"}]
+                }}}})
+                for operation in patch:
+                    assert operation["op"] == "add"
+                    path = operation["path"].strip("/").split("/")
+                    target = operand
+                    for segment in path[:-1]:
+                        target = target[int(segment)] if isinstance(target, list) else target[segment]
+                    target[path[-1]] = operation["value"]
+                state["operand"] = operand
             save()
         elif args[0] == "whoami":
             print(os.environ.get("TEST_API_URL", "https://api.test.invalid:6443") if "--show-server" in args else "test-admin")
@@ -128,7 +138,9 @@ elif tool == "oc":
         elif args[:2] == ["get", "daemonsets"]:
             print("daemonset.apps/nvidia-device-plugin-daemonset")
         elif args[:2] == ["get", "daemonset.apps/nvidia-device-plugin-daemonset"]:
-            operand = state.get("operand", {"spec":{"template":{"spec":{"containers":[{"name":"device-plugin"}]}}}})
+            operand = state.get("operand", {"spec":{"template":{"spec":{
+                "containers":[{"name":"device-plugin", "image":"test.invalid/device-plugin:v1"}]
+            }}}})
             print(json.dumps(operand))
         elif args[:2] == ["get", "nodes"]:
             if "json" in args:
@@ -385,6 +397,13 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("ready", pod["containers"][0]["readinessProbe"]["exec"]["command"])
         self.assertIn("chcon", pod["initContainers"][0]["command"][-1])
         self.assertFalse(pod["automountServiceAccountToken"])
+        operand = state["operand"]["spec"]["template"]["spec"]
+        self.assertNotIn("initContainers", operand)
+        self.assertEqual(operand["containers"][0]["image"], "test.invalid/device-plugin:v1")
+        self.assertTrue(operand["hostNetwork"])
+        self.assertEqual(operand["dnsPolicy"], "Default")
+        self.assertTrue(any(c["command"][:2] == ["patch", "daemonset.apps/nvidia-device-plugin-daemonset"]
+                            and "--type=json" in c["command"] for c in self.calls("oc")))
 
     def test_csv_wait_reports_olm_progress_and_timeout_diagnostics(self):
         self.live_environment()

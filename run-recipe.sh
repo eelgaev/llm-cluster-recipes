@@ -503,7 +503,8 @@ install_gpu_operator() {
   # ClusterPolicy has no field for these common pod-level network settings.
   # Patch every generated operand DaemonSet so API-using init containers (not
   # just k8s-driver-manager) use host networking, the host resolver, and the
-  # external API endpoint. Strategic merge preserves all other container env.
+  # external API endpoint. JSON Patch updates env without sending partial
+  # container objects that Kubernetes might validate as new init containers.
   # Operands appear in stages, so the readiness loop also configures later ones.
   wait_for "$CSV_TIMEOUT" "NVIDIA operand DaemonSets to be generated" \
     sh -c "oc get daemonsets -n '$GPU_NS' -o name | grep -q ."
@@ -519,43 +520,46 @@ configure_gpu_operand_networking() {
     # shellcheck disable=SC2016 # $pod is a yq variable
     if API_HOST="$API_HOST" API_PORT="$API_PORT" yq -p json -e '
       .spec.template.spec as $pod |
-      $pod.hostNetwork == true and $pod.dnsPolicy == "Default" and
-      ([$pod.containers[], $pod.initContainers[]] | map(select(
-        ([.env[] | select(.name == "KUBERNETES_SERVICE_HOST" and .value == strenv(API_HOST))] | length) == 0 or
-        ([.env[] | select(.name == "KUBERNETES_SERVICE_PORT" and .value == strenv(API_PORT))] | length) == 0
-      )) | length == 0)
-    ' <<<"$operand_json" >/dev/null; then
+      [
+        $pod.hostNetwork == true,
+        $pod.dnsPolicy == "Default",
+        ((($pod.containers // []) + ($pod.initContainers // [])) | map(select(
+          ((.env // []) | map(select(.name == "KUBERNETES_SERVICE_HOST" and .value == strenv(API_HOST))) | length) == 0 or
+          ((.env // []) | map(select(.name == "KUBERNETES_SERVICE_PORT" and .value == strenv(API_PORT))) | length) == 0
+        )) | length == 0)
+      ] | all
+    ' <<<"$operand_json" >/dev/null 2>&1; then
       continue
     fi
     # shellcheck disable=SC2016 # yq variables are intentionally single-quoted
     operand_patch=$(API_HOST="$API_HOST" API_PORT="$API_PORT" \
       yq -p json -o json -I=0 '
-        . as $ds |
-        {"spec":{"template":{"spec":{
-          "hostNetwork":true,
-          "dnsPolicy":"Default",
-          "initContainers": (($ds.spec.template.spec.initContainers // []) |
-            map({"name":.name, "env":(
-              ((.env // []) | map(select(
-                .name != "KUBERNETES_SERVICE_HOST" and
-                .name != "KUBERNETES_SERVICE_PORT"
-              ))) + [
-                {"name":"KUBERNETES_SERVICE_HOST", "value":strenv(API_HOST)},
-                {"name":"KUBERNETES_SERVICE_PORT", "value":strenv(API_PORT)}
-              ]
-            )})),
-          "containers": (($ds.spec.template.spec.containers // []) |
-            map({"name":.name, "env":(
-              ((.env // []) | map(select(
-                .name != "KUBERNETES_SERVICE_HOST" and
-                .name != "KUBERNETES_SERVICE_PORT"
-              ))) + [
-                {"name":"KUBERNETES_SERVICE_HOST", "value":strenv(API_HOST)},
-                {"name":"KUBERNETES_SERVICE_PORT", "value":strenv(API_PORT)}
-              ]
-            )}))
-        }}}}' <<<"$operand_json") || return 1
-    oc --request-timeout=30s patch "$operand_ds" -n "$GPU_NS" --type=strategic \
+        .spec.template.spec as $pod |
+        [
+          {"op":"add", "path":"/spec/template/spec/hostNetwork", "value":true},
+          {"op":"add", "path":"/spec/template/spec/dnsPolicy", "value":"Default"}
+        ] +
+        (($pod.initContainers // []) | to_entries | map({
+          "op":"add",
+          "path":("/spec/template/spec/initContainers/" + (.key | tostring) + "/env"),
+          "value": (((.value.env // []) | map(select(
+            .name != "KUBERNETES_SERVICE_HOST" and .name != "KUBERNETES_SERVICE_PORT"
+          ))) + [
+            {"name":"KUBERNETES_SERVICE_HOST", "value":strenv(API_HOST)},
+            {"name":"KUBERNETES_SERVICE_PORT", "value":strenv(API_PORT)}
+          ])
+        })) +
+        (($pod.containers // []) | to_entries | map({
+          "op":"add",
+          "path":("/spec/template/spec/containers/" + (.key | tostring) + "/env"),
+          "value": (((.value.env // []) | map(select(
+            .name != "KUBERNETES_SERVICE_HOST" and .name != "KUBERNETES_SERVICE_PORT"
+          ))) + [
+            {"name":"KUBERNETES_SERVICE_HOST", "value":strenv(API_HOST)},
+            {"name":"KUBERNETES_SERVICE_PORT", "value":strenv(API_PORT)}
+          ])
+        }))' <<<"$operand_json") || return 1
+    oc --request-timeout=30s patch "$operand_ds" -n "$GPU_NS" --type=json \
       -p "$operand_patch" >/dev/null || return 1
   done
 }
