@@ -36,6 +36,11 @@ case "$REGISTER_URL" in
   https://*) ;;
   *) echo "entrypoint: REGISTER_URL must use https" >&2; exit 1 ;;
 esac
+if [ "${SELF_REGISTER:-false}" = true ]; then
+  # The server registers itself (e.g. Legion's --registry-api, which also registers again
+  # periodically); the recipe touches /certs/registered once it has.
+  echo "entrypoint: the server registers itself with $REGISTER_URL"
+else
 (
   until curl --connect-timeout 2 --max-time 5 -ksf -H "Authorization: Bearer ${API_KEY}" \
     "https://127.0.0.1:${PORT}/health" >/dev/null; do sleep 5; done
@@ -52,6 +57,7 @@ esac
   done
   echo "entrypoint: registration succeeded"
 ) &
+fi
 
 # The recipe must remain in the foreground. If setup or the server fails, the
 # container exits so Kubernetes reports the failure and restarts it.

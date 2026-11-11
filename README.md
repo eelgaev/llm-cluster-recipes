@@ -255,7 +255,12 @@ python3 -m http.server 8080 --directory ..   # or any HTTP server
 `recipes/qwen3.8-27B-legion` serves the same weights with Legion instead of llama.cpp. Its folder
 only needs `recipe.yaml`: the script fetches the weights from the sibling folder named by
 `WEIGHTS_FOLDER` (default `qwen3.8-27B`), and it shares that recipe's `cacheKey`, so nodes that
-already cached the files reuse them. Serve both folders from the same parent:
+already cached the files reuse them. Legion registers itself with the `--register-url` endpoint
+(`legion serve --registry-api`, same `{host, port, api_key}` body) and registers again every 5
+minutes, so a restarted router picks the node up again. The recipe sets `SELF_REGISTER: "true"`,
+which makes the entrypoint skip its own POST; the recipe touches the readiness marker
+(`/certs/registered`) when Legion logs its first successful registration. Serve both folders from
+the same parent:
 
 ```
 ./run-recipe.sh https://host/recipes/qwen3.8-27B-legion/ --register-url https://router.example.com/register

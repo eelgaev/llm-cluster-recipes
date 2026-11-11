@@ -7,6 +7,8 @@ vars:
   WEIGHTS_FOLDER: qwen3.8-27B
   # GPUs to split the layers over; "auto" = every GPU the pod was given.
   GPUS: auto
+  # Legion registers itself with REGISTER_URL (--registry-api); the entrypoint skips its POST.
+  SELF_REGISTER: "true"
 script: |
   #!/usr/bin/env bash
   set -euo pipefail
@@ -45,6 +47,20 @@ script: |
   # tokens each, KV cache in q8_0 as the llama.cpp recipe; what does not fit in VRAM goes
   # to Legion's host KV tier. Legion renders the GGUF's own chat template and splits the
   # reasoning itself, so the llama.cpp recipe's template file is not used.
+  # Legion registers itself with the router (--registry-api, again every 5 minutes so a
+  # restarted router picks it up); the readiness probe's /certs/registered is touched when
+  # its first registration succeeds. Its output goes through the watcher below while legion
+  # stays the foreground process (it gets the pod's SIGTERM directly).
+  registered_watch() {
+    local line
+    while IFS= read -r line; do
+      printf '%s\n' "$line"
+      case $line in
+        *"registry: registered with the proxy"*) touch /certs/registered ;;
+      esac
+    done
+  }
+  exec > >(registered_watch) 2>&1
   exec legion serve \
       --host 0.0.0.0 --port "$PORT" \
       --api-key "$API_KEY" \
@@ -55,4 +71,5 @@ script: |
       --max-seqs 16 --ctx-size 262144 \
       --cache-type-k q8_0 --cache-type-v q8_0 \
       --spec mtp --spec-draft /models/mtp.gguf --spec-k 3 --spec-draft-vocab 65536 \
-      --default-temperature 1.0 --default-top-p 0.95 --default-top-k 20 --default-min-p 0.0
+      --default-temperature 1.0 --default-top-p 0.95 --default-top-k 20 --default-min-p 0.0 \
+      --registry-api "$REGISTER_URL" --registry-host "$NODE_HOST_IP"
