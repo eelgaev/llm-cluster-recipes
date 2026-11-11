@@ -24,11 +24,13 @@ image_for() {
   case "$1" in
     llama-cpp-arm) echo "${LLAMA_CPP_ARM_IMAGE:-quay.io/eelgaev/llama-cpp-arm:latest}" ;;
     llama-cpp-x86) echo "${LLAMA_CPP_X86_IMAGE:-quay.io/eelgaev/llama-cpp-x86:latest}" ;;
+    legion-arm)    echo "${LEGION_ARM_IMAGE:-quay.io/eelgaev/legion-arm:latest}" ;;
+    legion-x86)    echo "${LEGION_X86_IMAGE:-quay.io/eelgaev/legion-x86:latest}" ;;
     # ... add more type-arch entries here ...
     *) return 1 ;;
   esac
 }
-KNOWN_IMAGES="llama-cpp-arm llama-cpp-x86"
+KNOWN_IMAGES="llama-cpp-arm llama-cpp-x86 legion-arm legion-x86"
 
 # ----------------------------------------------------------------------------
 # Tunables

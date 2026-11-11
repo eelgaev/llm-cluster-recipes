@@ -120,6 +120,8 @@ Environment knobs:
 | `MODEL_CACHE_ROOT` | host directory for per-recipe model caches (default `/var/cache/llm-cluster-recipes/models`) |
 | `LLAMA_CPP_X86_IMAGE` | override the x86 llama.cpp runtime image |
 | `LLAMA_CPP_ARM_IMAGE` | override the ARM llama.cpp runtime image |
+| `LEGION_X86_IMAGE` | override the x86 Legion runtime image |
+| `LEGION_ARM_IMAGE` | override the ARM Legion runtime image |
 
 ## Manifests
 
@@ -211,6 +213,8 @@ image_for() {
   case "$1" in
     llama-cpp-arm) echo "${LLAMA_CPP_ARM_IMAGE:-quay.io/eelgaev/llama-cpp-arm:latest}" ;;
     llama-cpp-x86) echo "${LLAMA_CPP_X86_IMAGE:-quay.io/eelgaev/llama-cpp-x86:latest}" ;;
+    legion-arm)    echo "${LEGION_ARM_IMAGE:-quay.io/eelgaev/legion-arm:latest}" ;;
+    legion-x86)    echo "${LEGION_X86_IMAGE:-quay.io/eelgaev/legion-x86:latest}" ;;
     *) return 1 ;;
   esac
 }
@@ -221,6 +225,16 @@ support. Unsupported runtime types are rejected before cluster resources are cha
 `container/llama-cpp.Containerfile` builds a CUDA-enabled llama-server with TLS and the runtime tools
 needed by the recipe. The runner pulls a prebuilt image; it does not compile llama.cpp during
 deployment. Custom images must provide Bash, curl, OpenSSL, wget, coreutils, and the recipe runtime.
+
+`container/legion.Containerfile` builds [Legion](https://github.com/eelgaev/Legion) the same way
+(`--build-arg LEGION_REF=<branch|tag|commit>`, default `main`). The binary carries GPU code for
+`CUDA_ARCHS` (default `75;80;86;89;90;100;120`: Turing to Blackwell; CUDA 13 has no V100) and its
+commit is in `/usr/local/share/legion-commit`. Legion serves HTTPS itself (`--tls-cert`/`--tls-key`).
+
+```bash
+cd container
+podman build -f legion.Containerfile -t quay.io/eelgaev/legion-x86:latest .
+```
 
 The current deployment target is x86. Before enabling ARM GPU workers, publish an accessible ARM
 image or set `LLAMA_CPP_ARM_IMAGE`; private images also require appropriate cluster pull credentials.
@@ -237,6 +251,15 @@ python3 -m http.server 8080 --directory ..   # or any HTTP server
 
 `download.sh` is a maintainer-only convenience. The cluster never fetches or runs it, and no
 `HF_TOKEN` is needed cluster-side.
+
+`recipes/qwen3.8-27B-legion` serves the same weights with Legion instead of llama.cpp. Its folder
+only needs `recipe.yaml`: the script fetches the weights from the sibling folder named by
+`WEIGHTS_FOLDER` (default `qwen3.8-27B`), and it shares that recipe's `cacheKey`, so nodes that
+already cached the files reuse them. Serve both folders from the same parent:
+
+```
+./run-recipe.sh https://host/recipes/qwen3.8-27B-legion/ --register-url https://router.example.com/register
+```
 
 ## Checking on it
 

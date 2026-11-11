@@ -220,7 +220,8 @@ class RunnerTests(unittest.TestCase):
         self.env = dict(os.environ)
         for key in ("REPO_URL", "REPO_REF", "NS", "CSV_TIMEOUT", "RECONCILE_RESYNC",
                     "DRY_RUN", "MODEL_CACHE_ROOT", "BASH_ENV", "WAIT_FOR_READY", "DEPLOY_TIMEOUT",
-                    "LLAMA_CPP_X86_IMAGE", "LLAMA_CPP_ARM_IMAGE"):
+                    "LLAMA_CPP_X86_IMAGE", "LLAMA_CPP_ARM_IMAGE", "LEGION_X86_IMAGE",
+                    "LEGION_ARM_IMAGE"):
             self.env.pop(key, None)
         self.env.update(PATH=f"{self.bin}:{os.environ['PATH']}", DRY_RUN="true",
                         TEST_ROOT=str(self.path), TEST_MANIFESTS=str(ROOT / "manifests"),
